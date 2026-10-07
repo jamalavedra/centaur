@@ -14,6 +14,8 @@ class Principal < ApplicationRecord
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
   has_many :slack_channel_permissions, dependent: :destroy
+  has_many :google_chat_space_permissions, dependent: :destroy
+  has_many :google_chat_dm_permissions, dependent: :destroy
   has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
   has_many :mcp_oauth_authorization_codes, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
@@ -21,6 +23,8 @@ class Principal < ApplicationRecord
   belongs_to :console_user, class_name: "User", optional: true
 
   include SlackChannelPermissionOwner
+  include GoogleChatSpacePermissionOwner
+  include GoogleChatDmPermissionOwner
 
   after_commit :auto_grant_matching_oauth_credentials, on: %i[create update]
   after_create_commit :enqueue_slack_channel_catalog_refresh, if: :slack_channel_catalog_refreshable?
@@ -31,12 +35,17 @@ class Principal < ApplicationRecord
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
   SANDBOX_REPO_CACHE_LABEL = "centaur.sandbox_repo_cache".freeze
+  # Stamped by api-rs only from a signature-verified Google Chat identity: on a
+  # 1:1 DM space principal, and on the per-user requester principal.
+  GOOGLE_EMAIL_LABEL = "google_email".freeze
+  GCHAT_USER_KIND = "gchat_user".freeze
+  GOOGLE_CHAT_HUMAN_KINDS = %w[gchat_dm gchat_user].freeze
   TOOL_LABEL = "centaur-tool".freeze
   SANDBOX_REPO_CACHE_VALUES = %w[none public all].freeze
   UNKNOWN_KIND = "unknown".freeze
   KINDS = %w[
     unknown user console_user workflow slack_channel slack_dm discord_channel linear_issue
-    github_user teams_user teams_conversation
+    github_user teams_user teams_conversation gchat_dm gchat_space gchat_user
   ].freeze
   SLACK_USER_ID_FORMAT = /\A(?:[UW][A-Z0-9]{8,}|USLACK)\z/
   SLACK_CHANNEL_ID_FORMAT = /\A[CDG][A-Z0-9]{8,}\z/
@@ -92,12 +101,13 @@ class Principal < ApplicationRecord
     granted_secrets_by_priority(StaticSecret, :static_secret_id, includes: %i[source rules])
   end
 
-  # Static wrapper secrets this principal may carry into turns it starts as
-  # the requester: DIRECT grants only (never role grants, so shared role
-  # infrastructure cannot hoist), and only wrappers of broker credentials
-  # whose OAuth app an admin marked always_available. Starting from
-  # StaticSecret structurally excludes every other secret kind.
-  def always_available_static_secrets
+  # Static secrets this principal may carry into turns it starts as the
+  # requester: DIRECT grants only (never role grants, so shared role
+  # infrastructure cannot hoist). Starting from StaticSecret structurally
+  # excludes every other secret kind. Only always_available_static_secrets
+  # hoist by default; PrincipalSyncConfigSnapshot widens this for the Google
+  # Chat per-user requester.
+  def directly_granted_static_secrets
     priorities = grants
       .where.not(static_secret_id: nil)
       .group(:static_secret_id)
@@ -106,11 +116,18 @@ class Principal < ApplicationRecord
     StaticSecret
       .joins("INNER JOIN (#{priorities.to_sql}) granted_priorities " \
              "ON granted_priorities.secret_id = static_secrets.id")
+      .select("static_secrets.*", "granted_priorities.effective_priority")
+      .includes(:source, :rules, :broker_credential)
+      .order(Arel.sql("granted_priorities.effective_priority ASC, static_secrets.id ASC"))
+  end
+
+  # The directly granted wrappers of broker credentials whose OAuth app an
+  # admin marked always_available. Wrappers are auto-granted on consent, so
+  # unlike an operator's hand grant they need this per-app opt-in to hoist.
+  def always_available_static_secrets
+    directly_granted_static_secrets
       .joins(broker_credential: :oauth_app)
       .where(oauth_apps: { always_available: true })
-      .select("static_secrets.*", "granted_priorities.effective_priority")
-      .includes(:source, :rules)
-      .order(Arel.sql("granted_priorities.effective_priority ASC, static_secrets.id ASC"))
   end
 
   # gcp_auth credentials this principal resolves to, via its effective grants.
@@ -176,6 +193,22 @@ class Principal < ApplicationRecord
     self.console_user = User.find_by(email: slack_email.to_s.strip.downcase)
   end
 
+  # Google Chat's equivalent bridge. Chat has no first-class email column
+  # because the bot only learns a requester's address from the verified Add-on
+  # token; api-rs stamps that address into the `google_email` label on a
+  # confirmed 1:1 DM space principal and on the per-user requester principal.
+  # Unverified events never carry one, so the label is as trusted as
+  # slack_email. Called from the same API upsert boundary for the same reason:
+  # an omitted label must not activate a stale stored value.
+  def link_console_user_by_google_email
+    return unless GOOGLE_CHAT_HUMAN_KINDS.include?(kind)
+
+    email = labels.to_h[GOOGLE_EMAIL_LABEL].to_s.strip.downcase
+    return if email.blank?
+
+    self.console_user = User.find_by(email: email)
+  end
+
   def labels_with_sandbox_capabilities
     labels.to_h.merge(
       SANDBOX_REPO_CACHE_LABEL => sandbox_repo_cache
@@ -222,6 +255,107 @@ class Principal < ApplicationRecord
       @effective_slack_channel_permissions_payload
       @inherited_slack_channel_permissions_payload
       @slack_channel_ids_by_permission
+    ].each do |ivar|
+      remove_instance_variable(ivar) if instance_variable_defined?(ivar)
+    end
+  end
+
+  def effective_google_chat_space_permissions_payload
+    @effective_google_chat_space_permissions_payload ||=
+      merged_google_chat_space_permissions(effective_google_chat_space_permissions)
+  end
+
+  def inherited_google_chat_space_permissions_payload
+    @inherited_google_chat_space_permissions_payload ||= begin
+      permissions = if loaded_role_google_chat_permissions?(:google_chat_space_permissions)
+        roles.flat_map { |role| role.google_chat_space_permissions.to_a }
+      else
+        GoogleChatSpacePermission.where(role_id: role_ids)
+      end
+      merged_google_chat_space_permissions(permissions)
+    end
+  end
+
+  def effective_google_chat_dm_permissions_payload
+    @effective_google_chat_dm_permissions_payload ||=
+      merged_google_chat_dm_permissions(effective_google_chat_dm_permissions)
+  end
+
+  def inherited_google_chat_dm_permissions_payload
+    @inherited_google_chat_dm_permissions_payload ||= begin
+      permissions = if loaded_role_google_chat_permissions?(:google_chat_dm_permissions)
+        roles.flat_map { |role| role.google_chat_dm_permissions.to_a }
+      else
+        GoogleChatDmPermission.where(role_id: role_ids)
+      end
+      merged_google_chat_dm_permissions(permissions)
+    end
+  end
+
+  def google_chat_space_names_by_permission
+    @google_chat_space_names_by_permission ||= begin
+      initial = GoogleChatSpacePermission::PERMISSION_FLAGS.to_h { |flag| [ flag.fetch(:claim), [] ] }
+      effective_google_chat_space_permissions_payload.each_with_object(initial) do |row, spaces|
+        GoogleChatSpacePermission::PERMISSION_FLAGS.each do |flag|
+          spaces[flag.fetch(:claim)] << row.fetch("space_name") if row.fetch(flag.fetch(:attribute).to_s)
+        end
+      end
+    end
+  end
+
+  def google_chat_dm_setup_targets
+    effective_google_chat_dm_permissions_payload.filter_map do |row|
+      row.fetch("target_identity") if row.fetch("setup_enabled")
+    end.sort
+  end
+
+  def google_chat_reader_subject
+    email = labels&.fetch("google_email", nil) if kind == "gchat_dm"
+    email = email.to_s.strip.downcase
+    email if email.match?(URI::MailTo::EMAIL_REGEXP)
+  end
+
+  def google_chat_reader_subjects_by_space
+    spaces_by_id = google_chat_space_names_by_permission.values.flatten.uniq.to_h do |space|
+      [ space.delete_prefix("spaces/"), space ]
+    end
+    return {} if spaces_by_id.empty?
+
+    subjects = Hash.new { |hash, space| hash[space] = [] }
+    Principal.where("labels ->> 'gchat_space_id' IN (?)", spaces_by_id.keys)
+      .find_each do |space_principal|
+        space = spaces_by_id[space_principal.labels["gchat_space_id"]]
+        subject = space_principal.google_chat_reader_subject
+        subjects[space] << subject if space && subject
+      end
+    configured = labels["google_chat_reader_subjects"]
+    if configured.is_a?(String)
+      begin
+        configured = JSON.parse(configured)
+      rescue JSON::ParserError
+        configured = {}
+      end
+    end
+    if configured.is_a?(Hash)
+      configured.each do |space, email|
+        email = email.to_s.strip.downcase
+        subjects[space] << email if spaces_by_id.value?(space) && email.match?(URI::MailTo::EMAIL_REGEXP)
+      end
+    end
+    subjects.filter_map do |space, emails|
+      unique = emails.uniq
+      [ space, unique.first ] if unique.one?
+    end.to_h
+  end
+
+  def reset_google_chat_permissions_cache!
+    %i[
+      @effective_google_chat_space_permissions_payload
+      @inherited_google_chat_space_permissions_payload
+      @effective_google_chat_dm_permissions_payload
+      @inherited_google_chat_dm_permissions_payload
+      @google_chat_space_names_by_permission
+      @google_chat_dm_setup_targets
     ].each do |ivar|
       remove_instance_variable(ivar) if instance_variable_defined?(ivar)
     end
@@ -321,6 +455,58 @@ class Principal < ApplicationRecord
   def loaded_role_slack_channel_permissions?
     association(:roles).loaded? &&
       roles.all? { |role| role.association(:slack_channel_permissions).loaded? }
+  end
+
+  def effective_google_chat_space_permissions
+    effective_google_chat_permissions_for(:google_chat_space_permissions, GoogleChatSpacePermission)
+  end
+
+  def effective_google_chat_dm_permissions
+    effective_google_chat_permissions_for(:google_chat_dm_permissions, GoogleChatDmPermission)
+  end
+
+  def effective_google_chat_permissions_for(association_name, model)
+    association_rows = public_send(association_name)
+    return association_rows.to_a unless persisted?
+
+    if association(association_name).loaded? && loaded_role_google_chat_permissions?(association_name)
+      return association_rows.to_a + roles.flat_map { |role| role.public_send(association_name).to_a }
+    end
+
+    model.where(principal_id: id).or(model.where(role_id: role_ids))
+  end
+
+  def loaded_role_google_chat_permissions?(association_name)
+    association(:roles).loaded? && roles.all? { |role| role.association(association_name).loaded? }
+  end
+
+  def merged_google_chat_space_permissions(permissions)
+    merged_permission_rows(
+      permissions,
+      target_attribute: :space_name,
+      permission_attributes: GoogleChatSpacePermission::PERMISSION_ATTRIBUTE_NAMES
+    )
+  end
+
+  def merged_google_chat_dm_permissions(permissions)
+    merged_permission_rows(
+      permissions,
+      target_attribute: :target_identity,
+      permission_attributes: %w[setup_enabled]
+    )
+  end
+
+  def merged_permission_rows(permissions, target_attribute:, permission_attributes:)
+    ordered = permissions.sort_by do |permission|
+      [ permission.principal_id.present? ? 0 : 1, permission.role_id || 0, permission.id || 0 ]
+    end
+
+    ordered.each_with_object({}) do |permission, rows|
+      target = permission.public_send(target_attribute)
+      row = rows[target] ||= { target_attribute.to_s => target }
+      permission_attributes.each { |flag| row[flag] = false unless row.key?(flag) }
+      permission_attributes.each { |flag| row[flag] ||= permission.public_send(flag) }
+    end.values.sort_by { |row| row.fetch(target_attribute.to_s) }
   end
 
   def merged_slack_channel_permissions(permissions)

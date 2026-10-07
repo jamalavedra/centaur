@@ -3,6 +3,7 @@ packages:
   - services/linearbot
   - services/slackbotv2
   - services/discordbot
+  - services/googlechatbot
   - services/teamsbot
   - services/githubbot
 

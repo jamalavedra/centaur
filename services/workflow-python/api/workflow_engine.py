@@ -265,6 +265,77 @@ class WorkflowContext:
             }
         )
 
+    async def post_to_google_chat(self, space_name: str, text: str, **kwargs: Any) -> Any:
+        # Mirrors post_to_slack: api-rs holds GOOGLECHATBOT_INTERNAL_API_KEY
+        # and posts to the googlechatbot route, so the sandbox never handles the
+        # credential and never has to egress to the bot itself.
+        return await self._rpc.request(
+            {
+                "type": "ctx.post_to_google_chat",
+                "space_name": space_name,
+                "text": text,
+                "args": kwargs,
+            }
+        )
+
+    async def google_chat_dm_setup(self, target_identity: str) -> Any:
+        # Creates or reuses the bot's 1:1 DM space with target_identity and
+        # returns the Chat Space resource, so a workflow can post to a person
+        # without knowing their space name. api-rs holds the bot credential.
+        return await self._rpc.request(
+            {
+                "type": "ctx.google_chat_dm_setup",
+                "target_identity": target_identity,
+            }
+        )
+
+    async def post_to_google_chat_attachment(
+        self,
+        space_name: str,
+        filename: str,
+        content_base64: str,
+        **kwargs: Any,
+    ) -> Any:
+        # Same trust model: api-rs holds GOOGLECHATBOT_INTERNAL_API_KEY
+        # and posts to the googlechatbot attachments route. Optional kwargs:
+        # mime_type, text, thread_name.
+        return await self._rpc.request(
+            {
+                "type": "ctx.post_to_google_chat_attachment",
+                "space_name": space_name,
+                "filename": filename,
+                "content_base64": content_base64,
+                "args": kwargs,
+            }
+        )
+
+    async def google_chat_dwd_read(
+        self,
+        subject: str,
+        operation: str,
+        *,
+        resource_name: str = "",
+        page_size: int = 100,
+        page_token: str | None = None,
+        filter: str | None = None,
+        show_deleted: bool = False,
+    ) -> Any:
+        """Read Chat as an allowlisted Workspace user without exposing credentials."""
+        request: dict[str, Any] = {
+            "type": "ctx.google_chat_dwd_read",
+            "subject": subject,
+            "operation": operation,
+            "resource_name": resource_name,
+            "page_size": page_size,
+        }
+        if page_token:
+            request["page_token"] = page_token
+        if filter:
+            request["filter"] = filter
+        if show_deleted:
+            request["show_deleted"] = True
+        return await self._rpc.request(request)
+
 
 def duration_seconds(value: dt.timedelta | int | float) -> float:
     if isinstance(value, dt.timedelta):

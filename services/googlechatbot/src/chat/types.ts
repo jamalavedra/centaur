@@ -1,0 +1,268 @@
+export type NormalizedTextPart = {
+  type: 'text'
+  text: string
+}
+
+export type NormalizedBinaryPart = {
+  type: 'image' | 'file'
+  name: string
+  mime_type: string
+  size: number
+  // Absent when the bytes could not be inlined (Drive file, oversized, or a
+  // failed download) — downstream renders a placeholder instead of data.
+  source?: {
+    type: 'base64'
+    media_type: string
+    data: string
+  }
+  unavailable_reason?:
+    | 'download_not_configured'
+    | 'invalid_resource'
+    | 'declared_too_large'
+    | 'export_too_large'
+    | 'unsupported_native_file'
+    | 'download_failed'
+    | 'metadata_mismatch'
+}
+
+export type NormalizedPart = NormalizedTextPart | NormalizedBinaryPart
+
+// Google Chat API uses: SPACE (named), DIRECT_MESSAGE (DM), GROUP_CHAT
+// See: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space.FIELDS.type
+export type ChatSpaceType = 'SPACE' | 'DIRECT_MESSAGE' | 'GROUP_CHAT'
+
+/**
+ * A Space as GOOGLE describes it (spaces.get response), not as the request body
+ * claims it. The classified fields are `unknown` because this is the input to a
+ * credential decision: the classifier must be able to reject a `spaceType` or a
+ * `joinedDirectHumanUserCount` that arrives as null, a boolean or a string,
+ * which a typed `string`/`number` here would quietly launder into a pass.
+ * https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces#Space
+ */
+export type ChatSpaceResource = {
+  name?: string
+  /** Modern discriminator (SPACE | GROUP_CHAT | DIRECT_MESSAGE). Deliberately
+   * NOT the deprecated `type` field, which cannot express GROUP_CHAT. */
+  spaceType?: unknown
+  membershipCount?: { joinedDirectHumanUserCount?: unknown } | null
+  displayName?: string
+}
+
+export type NormalizedChatEvent = {
+  thread_key: string
+  message_id: string
+  space_name: string
+  space_type: ChatSpaceType
+  user_id: string
+  user_name: string
+  /** Requester email when the sender profile exposes it (same-workspace
+   * humans). The Console matches it against the signed-in user's email to
+   * grant thread visibility (Chat analogue of Slack's slack_user_id, #875). */
+  user_email?: string
+  is_mention: boolean
+  parts: NormalizedPart[]
+  history_messages?: Array<{
+    message_id: string
+    role?: 'user' | 'assistant'
+    parts: NormalizedPart[]
+    user_id?: string
+    metadata?: Record<string, unknown>
+  }>
+  chat: {
+    event_time?: string
+    message_name?: string
+    thread_name?: string
+    thread_reply?: boolean
+  }
+}
+
+// Matches Google Chat Event schema:
+// https://developers.google.com/workspace/chat/api/reference/rest/v1/Event
+export type GoogleChatEnvelope = {
+  type?: string
+  eventTime?: string
+  dialogEventType?: string
+  authorizationEventObject?: {
+    systemIdToken?: string
+    userIdToken?: string
+  }
+  space?: {
+    name?: string
+    spaceType?: string
+    type?: string
+    displayName?: string
+    singleUserBotDm?: boolean
+  }
+  message?: {
+    name?: string
+    text?: string
+    thread?: { name?: string }
+    sender?: {
+      name?: string
+      displayName?: string
+      domainId?: string
+      type?: 'HUMAN' | 'BOT'
+      isAnonymous?: boolean
+    }
+    argumentText?: string
+    slashCommand?: { commandId?: string }
+    threadReply?: boolean
+    attachment?: Array<{
+      name?: string
+      contentName?: string
+      contentType?: string
+      source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
+      thumbnailUri?: string
+      downloadUri?: string
+      attachmentDataRef?: { resourceName?: string }
+      driveDataRef?: { driveFileId?: string }
+    }>
+    annotations?: Array<{
+      type?: string
+      userMention?: {
+        user?: { name?: string; type?: 'HUMAN' | 'BOT' }
+        type?: string
+      }
+    }>
+    formattedText?: string
+    fallbackText?: string
+    attachedGifs?: Array<{ uri?: string }>
+    quotedMessageMetadata?: Record<string, unknown>
+    cardsV2?: Array<Record<string, unknown>>
+  }
+  user?: {
+    name?: string
+    displayName?: string
+    domainId?: string
+    type?: 'HUMAN' | 'BOT'
+    isAnonymous?: boolean
+  }
+  thread?: {
+    name?: string
+  }
+  action?: {
+    actionMethodName?: string
+    parameters?: Array<{ key?: string; value?: string }>
+  }
+  // CARD_CLICKED events: the invoked cardsV2 button (onClick.action.function)
+  // and its parameters come back under `common`, per the modern Chat API
+  // (event.common.invokedFunction / event.common.parameters). NOTE: this
+  // shape is not exercised against a live Google Chat backend anywhere in
+  // this codebase yet -- verify it against a real CARD_CLICKED payload before
+  // relying on it in production.
+  common?: {
+    invokedFunction?: string
+    parameters?: Record<string, unknown>
+    formInputs?: Record<string, unknown>
+  }
+  appCommandMetadata?: {
+    appCommandId?: string
+    appCommandType?: string
+  }
+}
+
+export type GoogleChatActionType = 'card_click' | 'app_command' | 'submit_form'
+
+// Typed payload dispatched to api-rs as
+// `google_chat.<event_type>.<invoked_function>`.
+export type GoogleChatActionPayload = {
+  event_type: GoogleChatActionType
+  invoked_function: string
+  message_name?: string
+  parameters?: Record<string, unknown>
+  form_inputs?: Record<string, unknown>
+  space_name: string
+  thread_name?: string
+  user_email?: string
+  user_id?: string
+  user_name?: string
+}
+
+export type GoogleChatWorkflowEvent = {
+  event_name: `google_chat.${GoogleChatActionType}.${string}`
+  payload: GoogleChatActionPayload
+}
+
+// Inbound message shape returned by spaces.messages.list / spaces.messages.get.
+// Richer than the outbound `GoogleChatMessage` (which only types fields we send).
+// Field reference: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#Message
+export type ChatListMessage = {
+  name?: string
+  clientAssignedMessageId?: string
+  text?: string
+  formattedText?: string
+  argumentText?: string
+  threadReply?: boolean
+  createTime?: string
+  sender?: {
+    name?: string
+    displayName?: string
+    domainId?: string
+    type?: 'HUMAN' | 'BOT'
+    isAnonymous?: boolean
+  }
+  fallbackText?: string
+  attachedGifs?: Array<{ uri?: string }>
+  quotedMessageMetadata?: Record<string, unknown>
+  cardsV2?: Array<Record<string, unknown>>
+  attachment?: Array<{
+    name?: string
+    contentName?: string
+    contentType?: string
+    source?: 'UPLOADED_CONTENT' | 'DRIVE_FILE'
+    thumbnailUri?: string
+    downloadUri?: string
+    attachmentDataRef?: { resourceName?: string }
+    driveDataRef?: { driveFileId?: string }
+  }>
+}
+
+export type GoogleChatMessage = {
+  name?: string
+  text?: string
+  fallbackText?: string
+  cardsV2?: Array<{
+    cardId?: string
+    card: GoogleChatCard
+  }>
+  thread?: {
+    name?: string
+  }
+  // Outbound uploads: the whole UploadAttachmentResponse goes in this list,
+  // per the official "Upload media as a file attachment" flow.
+  attachment?: UploadAttachmentResponse[]
+}
+
+export type UploadAttachmentResponse = {
+  attachmentDataRef?: { resourceName?: string; attachmentUploadToken?: string }
+}
+
+export type GoogleChatCard = {
+  header?: { title: string }
+  sections?: GoogleChatCardSection[]
+}
+
+export type GoogleChatCardSection = {
+  header?: string
+  widgets?: GoogleChatCardWidget[]
+}
+
+export type GoogleChatCardWidget = {
+  // textSyntax MARKDOWN makes Google Chat render Markdown (bold, italic, links,
+  // inline code, code fences, lists) instead of the default HTML. Available for
+  // Chat apps; see cards reference Message.TextSyntax.
+  textParagraph?: { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
+  image?: { imageUrl: string; altText?: string }
+  buttonList?: { buttons: GoogleChatButton[] }
+}
+
+export type GoogleChatButton = {
+  text: string
+  onClick?: {
+    openLink?: { url: string }
+    action?: {
+      function: string
+      parameters?: Array<{ key: string; value: string }>
+    }
+  }
+}

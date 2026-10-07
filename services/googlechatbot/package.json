@@ -1,0 +1,30 @@
+{
+  "name": "googlechatbot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "smoke": "bun scripts/smoke.ts",
+    "test": "for file in $(find src -name '*.test.ts' | sort); do bun test \"$file\" || exit 1; done",
+    "check:types": "bun tsgo --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@centaur/harness-events": "workspace:*",
+    "@centaur/rendering": "workspace:*",
+    "@chat-adapter/state-pg": "4.40.0",
+    "chat": "4.40.0",
+    "hono": "^4.13.12",
+    "pg": "^8.23.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@chat-adapter/state-memory": "4.40.0",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "typescript": "^7.0.2"
+  }
+}

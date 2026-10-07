@@ -432,6 +432,32 @@
                 "syncIntervalSeconds": { "type": "integer" }
               }
             },
+            "googleChat": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncIntervalSeconds": { "type": "integer" },
+                "includeSpaceTypes": { "type": "string" },
+                "maxPagesPerRun": { "type": "integer" },
+                "spaceIds": { "type": "string" },
+                "retention": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "intervalMinutes": { "type": "integer", "minimum": 1 },
+                    "days": { "type": "integer", "minimum": 0 },
+                    "batchLimit": { "type": "integer", "minimum": 1 }
+                  }
+                },
+                "dmSync": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "subjects": { "type": "string" }
+                  }
+                }
+              }
+            },
             "companyContextDocuments": {
               "type": "object",
               "properties": {
@@ -505,6 +531,99 @@
           "type": "object",
           "additionalProperties": { "type": "string" }
         }
+      }
+    },
+    "googlechatbot": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer" },
+        "stateKeyPrefix": { "type": "string", "minLength": 1 },
+        "statePool": {
+          "type": "object",
+          "properties": {
+            "max": { "type": "integer", "minimum": 1 },
+            "idleTimeoutMs": { "type": "integer", "minimum": 1 },
+            "connectTimeoutMs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "stateConnect": {
+          "type": "object",
+          "properties": {
+            "initialDelayMs": { "type": "integer", "minimum": 1 },
+            "maxDelayMs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "properties": {
+            "maxObligationAgeMs": { "type": "integer", "minimum": 1 },
+            "failureBudget": { "type": "integer", "minimum": 1 },
+            "sweepIntervalMs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string" }
+          }
+        },
+        "eventsPath": { "type": "string" },
+        "requireSignedRequests": { "type": "boolean" },
+        "ingressMode": {
+          "type": "string",
+          "enum": ["chat_api_project", "chat_api_url", "workspace_addon"]
+        },
+        "projectNumber": { "type": "string" },
+        "webhookAudience": { "type": "string" },
+        "addonServiceAccountEmail": { "type": "string" },
+        "addonOauthClientId": { "type": "string" },
+        "signedRequestMaxAgeSeconds": { "type": "integer", "minimum": 1 },
+        "allowedDomain": { "type": "string" },
+        "uploadUser": { "type": "string" },
+        "reactionReadUser": { "type": "string" },
+        "driveDownloadUser": { "type": "string" },
+        "codexNanocodexRolloutPercent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "threadHistoryLimit": { "type": "integer", "minimum": 1 },
+        "attachmentAggregateMaxBytes": { "type": "integer", "minimum": 1 },
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseServiceTierEnabled": { "type": "boolean" },
+        "ingress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "className": { "type": "string" },
+            "host": { "type": "string" },
+            "annotations": { "type": "object" },
+            "tls": { "type": "array" }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "scrapeAnnotations": { "type": "boolean" },
+            "path": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        },
+        "extraEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": { "type": "object" }
+
       }
     },
     "externalDatabase": {

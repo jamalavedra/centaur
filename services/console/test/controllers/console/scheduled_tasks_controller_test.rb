@@ -2,6 +2,9 @@ require "test_helper"
 
 class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
   setup do
+    # The Slack delivery options only render when a bot token is configured.
+    @previous_slack_bot_token = ENV["SLACK_BOT_TOKEN"]
+    ENV["SLACK_BOT_TOKEN"] = "xoxb-test-token"
     @operator = users(:acme_admin)
     @operator.user_identities.create!(
       provider: "slack",
@@ -9,6 +12,10 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
       team_id: "T0123456789"
     )
     post login_url, params: { email: @operator.email, password: "password123456" }
+  end
+
+  teardown do
+    ENV["SLACK_BOT_TOKEN"] = @previous_slack_bot_token
   end
 
   test "renders the single-turn task form" do
@@ -249,7 +256,149 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_scheduled_tasks_path
   end
 
+  test "creates a task that delivers to the author's Google Chat DM" do
+    post console_scheduled_tasks_url, params: {
+      scheduled_task: task_params.merge(delivery_mode: "gchat", delivery_destination: "dm", delivery_channel: "C0123456789")
+    }
+
+    assert_redirected_to console_scheduled_tasks_path
+    task = ScheduledTask.order(:id).last
+    assert_equal @operator.email.downcase, task.delivery_channel
+    assert_equal :gchat_dm, task.delivery_platform
+  end
+
+  test "creates a task that delivers to a granted Google Chat space" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+
+    post console_scheduled_tasks_url, params: {
+      scheduled_task: task_params.merge(
+        delivery_mode: "gchat",
+        delivery_channel: "C0123456789",
+        delivery_destination: "spaces/AAQA42QLdws"
+      )
+    }
+
+    assert_redirected_to console_scheduled_tasks_path
+    assert_equal "spaces/AAQA42QLdws", ScheduledTask.order(:id).last.delivery_channel
+  end
+
+  test "creates a task from a raw Google Chat space name that overrides the picker" do
+    grant_google_chat_space("spaces/AAQAraw12345")
+
+    post console_scheduled_tasks_url, params: {
+      scheduled_task: task_params.merge(
+        delivery_mode: "gchat",
+        delivery_destination: "dm",
+        delivery_space_custom: " spaces/AAQAraw12345 "
+      )
+    }
+
+    assert_redirected_to console_scheduled_tasks_path
+    assert_equal "spaces/AAQAraw12345", ScheduledTask.order(:id).last.delivery_channel
+  end
+
+  test "rejects a Google Chat space the author cannot send to" do
+    assert_no_difference -> { ScheduledTask.count } do
+      post console_scheduled_tasks_url, params: {
+        scheduled_task: task_params.merge(
+          delivery_mode: "gchat",
+          delivery_destination: "spaces/AAQAungranted"
+        )
+      }
+    end
+
+    assert_response :unprocessable_entity
+    assert_select "li", text: "Delivery channel is not available to the author"
+  end
+
+  test "hides the Slack delivery options when no Slack bot token is configured" do
+    with_env("SLACK_BOT_TOKEN" => nil, "CENTAUR_CONSOLE_SLACK_BOT_TOKEN" => nil) do
+      get new_console_scheduled_task_url
+    end
+
+    assert_response :ok
+    assert_select "form[data-controller='slack-channel-autocomplete']", count: 0
+    assert_select "input[type=radio][name='scheduled_task[delivery_mode]']", count: 0
+    assert_select "input[type=hidden][name='scheduled_task[delivery_mode]'][value=gchat]"
+    assert_select "select[name='scheduled_task[delivery_destination]']"
+    assert_select "input[name='scheduled_task[delivery_space_custom]']"
+  end
+
+  test "hides Slack delivery when nothing is deliverable despite a configured token" do
+    SlackBotChannel.delete_all
+    @operator.user_identities.destroy_all
+
+    get new_console_scheduled_task_url
+
+    assert_response :ok
+    assert_select "input[type=radio][name='scheduled_task[delivery_mode]']", count: 0
+    assert_select "input[type=hidden][name='scheduled_task[delivery_mode]'][value=gchat]"
+    assert_select "select[name='scheduled_task[delivery_destination]']"
+  end
+
+  test "labels granted spaces with their display names in the destination picker" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get new_console_scheduled_task_url
+    end
+
+    assert_response :ok
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/AAQA42QLdws']",
+                  text: "AI"
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value=dm]",
+                  text: "Your direct message"
+  end
+
+  test "keeps unnamed granted spaces out of the picker when names are available" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    principal = ConsoleUserPrincipalProvisioner.call(@operator)
+    GoogleChatSpacePermission.replace_for!(
+      principal,
+      [ { space_name: "spaces/AAQA42QLdws", send_enabled: true },
+        { space_name: "spaces/dmNoName1234", send_enabled: true } ]
+    )
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get new_console_scheduled_task_url
+    end
+
+    assert_response :ok
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/AAQA42QLdws']"
+    assert_select "select[name='scheduled_task[delivery_destination]'] option[value='spaces/dmNoName1234']", count: 0
+  end
+
+  test "shows the space display name on the task table" do
+    grant_google_chat_space("spaces/AAQA42QLdws")
+    create_task.update!(delivery_channel: "spaces/AAQA42QLdws")
+
+    GoogleChatSpaceDirectory.stub(:display_names, { "spaces/AAQA42QLdws" => "AI" }) do
+      get console_scheduled_tasks_url
+    end
+
+    assert_response :ok
+    assert_select "td", text: /AI/
+  end
+
+  test "shows the Google Chat DM destination on the task table" do
+    create_task.update!(delivery_channel: @operator.email.downcase)
+
+    get console_scheduled_tasks_url
+
+    assert_response :ok
+    assert_select "td", text: /Google Chat DM to you/
+  end
+
   private
+
+  def grant_google_chat_space(space_name, user: @operator)
+    principal = ConsoleUserPrincipalProvisioner.call(user)
+    GoogleChatSpacePermission.replace_for!(
+      principal,
+      [ { space_name: space_name, send_enabled: true } ]
+    )
+    principal
+  end
 
   def task_params
     {

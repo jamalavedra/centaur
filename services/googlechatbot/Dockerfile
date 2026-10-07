@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+
+FROM oven/bun:1.4.2-slim AS build
+
+WORKDIR /repo
+ENV NODE_ENV=production
+
+RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install -g pnpm@10.28.1
+
+# Workspace manifests first so dependency install is a cached layer. googlechatbot depends on the
+# @centaur/* workspace packages, so they must be present for pnpm to link the `workspace:*` ranges.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches/ patches/
+COPY packages/ packages/
+COPY services/googlechatbot/package.json services/googlechatbot/package.json
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+    pnpm install --filter googlechatbot --prod --frozen-lockfile
+
+COPY services/googlechatbot/ services/googlechatbot/
+# Harness config files: response-context.ts imports the baked default
+# models (harness/claude/settings.json, harness/codex/config.toml) so the
+# Chat response footer can name the model a harness runs without a
+# hardcoded copy of those values.
+COPY harness/ harness/
+
+FROM oven/bun:1.4.2-slim
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /repo /repo
+WORKDIR /repo/services/googlechatbot
+ENV NODE_ENV=production
+
+EXPOSE 3002
+ENV PORT=3002
+# Run as the non-root `bun` user (uid/gid 1000) shipped by the base image; the bot only needs
+# read access to /repo and listens on 3002 (>1024), so no ownership changes are required.
+USER bun
+CMD ["bun", "src/server.ts"]

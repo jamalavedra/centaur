@@ -50,6 +50,16 @@ pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const GOOGLECHATBOT_INTERNAL_URL_ENV: &str = "GOOGLECHATBOT_INTERNAL_URL";
+const GOOGLECHATBOT_INTERNAL_API_KEY_ENV: &str = "GOOGLECHATBOT_INTERNAL_API_KEY";
+const GOOGLE_CHAT_DWD_DM_SYNC_ENABLED_ENV: &str = "GOOGLE_CHAT_DWD_DM_SYNC_ENABLED";
+const GOOGLE_CHAT_DWD_DM_SUBJECTS_ENV: &str = "GOOGLE_CHAT_DWD_DM_SUBJECTS";
+const GOOGLE_CHAT_DWD_SUBJECT_HEADER: &str = "x-centaur-google-chat-dwd-subject";
+const WORKFLOW_HOST_SECRET_ENV_KEYS: [&str; 2] = [
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    GOOGLECHATBOT_INTERNAL_API_KEY_ENV,
+];
+const MAX_GOOGLE_CHAT_DWD_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
@@ -1139,6 +1149,8 @@ fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
         | "company_context_embeddings"
         | "memory_generation"
         | "slack_retention"
+        | "google_chat_sync"
+        | "google_chat_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
     }
@@ -1863,6 +1875,7 @@ async fn discover_python_workflow_metadata() -> Result<PythonWorkflowMetadata, W
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    scrub_workflow_host_secret_env(&mut command);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -3021,6 +3034,7 @@ async fn run_python_workflow_host_local(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    scrub_workflow_host_secret_env(&mut command);
     if env::var_os("WORKFLOW_DIRS").is_none() {
         command.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
@@ -3573,6 +3587,26 @@ async fn handle_python_context_request(
         }
         Some("ctx.post_to_slack") => {
             match post_python_slack_message(message, ctx, &request_id).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        Some("ctx.post_to_google_chat") => match post_google_chat_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
+        Some("ctx.post_to_google_chat_attachment") => {
+            match post_google_chat_attachment(message).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        Some("ctx.google_chat_dm_setup") => match google_chat_dm_setup(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
+        Some("ctx.google_chat_dwd_read") => {
+            match google_chat_dwd_read(message, &input.workflow_name).await {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
             }
@@ -4152,6 +4186,23 @@ fn python_workflow_host_path() -> PathBuf {
         .join("workflow_host.py")
 }
 
+fn scrub_workflow_host_secret_env(command: &mut Command) {
+    for name in WORKFLOW_HOST_SECRET_ENV_KEYS {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(is_workflow_host_secret_env_key) {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn is_workflow_host_secret_env_key(name: &str) -> bool {
+    WORKFLOW_HOST_SECRET_ENV_KEYS
+        .iter()
+        .any(|secret| name.ends_with(secret))
+}
+
 fn default_workflow_dirs() -> String {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -4343,6 +4394,472 @@ async fn send_slack_request(
         )));
     }
     Ok(response)
+}
+
+async fn post_to_googlechatbot(
+    path: &str,
+    body: &Value,
+    timeout: std::time::Duration,
+    failure: &str,
+) -> Result<Value, WorkflowRuntimeError> {
+    let token = env::var(GOOGLECHATBOT_INTERNAL_API_KEY_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{GOOGLECHATBOT_INTERNAL_API_KEY_ENV} must be set"
+        ))
+    })?;
+    let base_url = env::var(GOOGLECHATBOT_INTERNAL_URL_ENV).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!("{GOOGLECHATBOT_INTERNAL_URL_ENV} must be set"))
+    })?;
+    let response = reqwest::Client::new()
+        .post(format!("{}{path}", base_url.trim_end_matches('/')))
+        .bearer_auth(&token)
+        .json(body)
+        .timeout(timeout)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "{failure}: {status} {value}"
+        )));
+    }
+    Ok(value)
+}
+
+struct GoogleChatDwdBrokerConfig {
+    enabled: bool,
+    subjects: BTreeSet<String>,
+    internal_url: String,
+    internal_key: String,
+}
+
+impl GoogleChatDwdBrokerConfig {
+    fn from_env() -> Result<Self, WorkflowRuntimeError> {
+        let enabled = env::var(GOOGLE_CHAT_DWD_DM_SYNC_ENABLED_ENV).is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        let subjects = env::var(GOOGLE_CHAT_DWD_DM_SUBJECTS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| {
+                let subject = value.trim().to_ascii_lowercase();
+                (!subject.is_empty()).then_some(subject)
+            })
+            .collect();
+        let internal_key = env::var(GOOGLECHATBOT_INTERNAL_API_KEY_ENV).map_err(|_| {
+            WorkflowRuntimeError::BadRequest("Google Chat DWD broker is not configured".to_owned())
+        })?;
+        let internal_url = env::var(GOOGLECHATBOT_INTERNAL_URL_ENV).map_err(|_| {
+            WorkflowRuntimeError::BadRequest("Google Chat DWD broker is not configured".to_owned())
+        })?;
+        Ok(Self {
+            enabled,
+            subjects,
+            internal_url,
+            internal_key,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct GoogleChatDwdReadRequest {
+    subject: String,
+    path: String,
+    page_size: u64,
+    page_token: Option<String>,
+    filter: Option<String>,
+    show_deleted: bool,
+}
+
+fn parse_google_chat_dwd_read(
+    message: &Value,
+    config: &GoogleChatDwdBrokerConfig,
+) -> Result<GoogleChatDwdReadRequest, WorkflowRuntimeError> {
+    let operation = required_python_string(message, "operation", "ctx.google_chat_dwd_read")?;
+    let reaction_read = operation == "list_reactions";
+    let subject = if reaction_read
+        && message
+            .get("subject")
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty)
+    {
+        String::new()
+    } else {
+        if !config.enabled {
+            return Err(WorkflowRuntimeError::Disabled(
+                "Google Chat DWD DM sync is disabled".to_owned(),
+            ));
+        }
+        let raw_subject = required_python_string(message, "subject", "ctx.google_chat_dwd_read")?;
+        let subject = raw_subject.trim().to_ascii_lowercase();
+        if raw_subject != subject || !valid_google_chat_dwd_subject(&subject) {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "invalid Google Chat DWD subject".to_owned(),
+            ));
+        }
+        if !config.subjects.contains(&subject) {
+            return Err(WorkflowRuntimeError::Disabled(
+                "Google Chat DWD subject is not allowed".to_owned(),
+            ));
+        }
+        subject
+    };
+    let resource_name = message
+        .get("resource_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let path = match operation {
+        "list_spaces" if resource_name.is_empty() => "/api/chat/spaces".to_owned(),
+        "list_messages" => {
+            let space_id = google_chat_space_id(resource_name)?;
+            format!("/api/chat/spaces/{space_id}/messages")
+        }
+        "list_members" => {
+            let space_id = google_chat_space_id(resource_name)?;
+            format!("/api/chat/spaces/{space_id}/members")
+        }
+        "list_reactions" => {
+            let (space_id, message_id) = google_chat_message_ids(resource_name)?;
+            format!("/api/chat/spaces/{space_id}/messages/{message_id}/reactions")
+        }
+        _ => {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "unsupported Google Chat DWD read operation".to_owned(),
+            ));
+        }
+    };
+    let page_size = message
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(100);
+    if !(1..=100).contains(&page_size) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "Google Chat DWD page_size must be between 1 and 100".to_owned(),
+        ));
+    }
+    let page_token = message
+        .get("page_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if page_token
+        .as_deref()
+        .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+    {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "invalid Google Chat DWD page token".to_owned(),
+        ));
+    }
+    let filter = message
+        .get("filter")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if filter.is_some() && operation != "list_messages" {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "Google Chat DWD filter is only valid for list_messages".to_owned(),
+        ));
+    }
+    if filter
+        .as_deref()
+        .is_some_and(|value| !valid_google_chat_create_time_filter(value))
+    {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "invalid Google Chat DWD message filter".to_owned(),
+        ));
+    }
+    let show_deleted = message
+        .get("show_deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if show_deleted && operation != "list_messages" {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "Google Chat DWD show_deleted is only valid for list_messages".to_owned(),
+        ));
+    }
+    Ok(GoogleChatDwdReadRequest {
+        subject,
+        path,
+        page_size,
+        page_token,
+        filter,
+        show_deleted,
+    })
+}
+
+fn valid_google_chat_dwd_subject(subject: &str) -> bool {
+    subject.len() <= 320
+        && !subject.chars().any(char::is_control)
+        && !subject.chars().any(char::is_whitespace)
+        && subject.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+        })
+}
+
+fn valid_google_chat_resource_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn google_chat_space_id(resource_name: &str) -> Result<&str, WorkflowRuntimeError> {
+    let mut parts = resource_name.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("spaces"), Some(space_id), None) if valid_google_chat_resource_id(space_id) => {
+            Ok(space_id)
+        }
+        _ => Err(WorkflowRuntimeError::BadRequest(
+            "invalid Google Chat space resource name".to_owned(),
+        )),
+    }
+}
+
+/// Path of a googlechatbot internal relay collection for `space_name`.
+///
+/// Every relay route is space-scoped (`/api/chat/spaces/{id}/…`); the flat
+/// `/api/chat/messages` and `/api/chat/attachments` routes no longer exist, so
+/// building the path anywhere else silently 404s every delivery.
+fn google_chat_relay_path(
+    space_name: &str,
+    collection: &str,
+) -> Result<String, WorkflowRuntimeError> {
+    let space_id = google_chat_space_id(space_name)?;
+    Ok(format!("/api/chat/spaces/{space_id}/{collection}"))
+}
+
+/// Path of the googlechatbot internal DM setup route for `target_identity`.
+///
+/// DM setup is keyed by the target email in the query string rather than by a
+/// space, so it cannot reuse the space-scoped `google_chat_relay_path`.
+fn google_chat_dm_setup_path(target_identity: &str) -> Result<String, WorkflowRuntimeError> {
+    let target = target_identity.trim().to_ascii_lowercase();
+    if !valid_google_chat_dwd_subject(&target) {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.google_chat_dm_setup requires an email target_identity".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "/api/chat/dms/setup?target_identity={}",
+        urlencoding::encode(&target)
+    ))
+}
+
+fn google_chat_message_ids(resource_name: &str) -> Result<(&str, &str), WorkflowRuntimeError> {
+    let mut parts = resource_name.split('/');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("spaces"), Some(space_id), Some("messages"), Some(message_id), None)
+            if valid_google_chat_resource_id(space_id)
+                && valid_google_chat_resource_id(message_id) =>
+        {
+            Ok((space_id, message_id))
+        }
+        _ => Err(WorkflowRuntimeError::BadRequest(
+            "invalid Google Chat message resource name".to_owned(),
+        )),
+    }
+}
+
+fn valid_google_chat_create_time_filter(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .strip_prefix("createTime > \"")
+            .and_then(|value| value.strip_suffix('"'))
+            .is_some_and(|timestamp| DateTime::parse_from_rfc3339(timestamp).is_ok())
+}
+
+fn ensure_google_chat_dwd_workflow(workflow_name: &str) -> Result<(), WorkflowRuntimeError> {
+    if workflow_name == "google_chat_sync" {
+        return Ok(());
+    }
+    Err(WorkflowRuntimeError::Disabled(
+        "Google Chat DWD reads are restricted to google_chat_sync".to_owned(),
+    ))
+}
+
+async fn google_chat_dwd_read(
+    message: &Value,
+    workflow_name: &str,
+) -> Result<Value, WorkflowRuntimeError> {
+    ensure_google_chat_dwd_workflow(workflow_name)?;
+    let config = GoogleChatDwdBrokerConfig::from_env()?;
+    google_chat_dwd_read_with_config(message, &config).await
+}
+
+async fn google_chat_dwd_read_with_config(
+    message: &Value,
+    config: &GoogleChatDwdBrokerConfig,
+) -> Result<Value, WorkflowRuntimeError> {
+    let broker_request = parse_google_chat_dwd_read(message, config)?;
+    let mut url = reqwest::Url::parse(&format!(
+        "{}{}",
+        config.internal_url.trim_end_matches('/'),
+        broker_request.path
+    ))
+    .map_err(|_| WorkflowRuntimeError::BadRequest("invalid Google Chat internal URL".to_owned()))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("page_size", &broker_request.page_size.to_string());
+        if let Some(page_token) = &broker_request.page_token {
+            query.append_pair("page_token", page_token);
+        }
+        if let Some(filter) = &broker_request.filter {
+            query.append_pair("filter", filter);
+        }
+        if broker_request.show_deleted {
+            query.append_pair("show_deleted", "true");
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| {
+            WorkflowRuntimeError::Internal("Google Chat DWD broker client failed".to_owned())
+        })?;
+    let mut request = client.get(url).bearer_auth(&config.internal_key);
+    if !broker_request.subject.is_empty() {
+        request = request.header(GOOGLE_CHAT_DWD_SUBJECT_HEADER, &broker_request.subject);
+    }
+    let response = request.send().await.map_err(|_| {
+        WorkflowRuntimeError::Upstream("Google Chat DWD broker request failed".to_owned())
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "Google Chat DWD broker request failed with status {status}"
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GOOGLE_CHAT_DWD_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkflowRuntimeError::Upstream(
+            "Google Chat DWD broker response exceeded the size limit".to_owned(),
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.try_next().await.map_err(|_| {
+        WorkflowRuntimeError::Upstream("Google Chat DWD broker response failed".to_owned())
+    })? {
+        if body.len().saturating_add(chunk.len()) > MAX_GOOGLE_CHAT_DWD_RESPONSE_BYTES {
+            return Err(WorkflowRuntimeError::Upstream(
+                "Google Chat DWD broker response exceeded the size limit".to_owned(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| {
+        WorkflowRuntimeError::Upstream("Google Chat DWD broker returned invalid JSON".to_owned())
+    })
+}
+
+async fn post_google_chat_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let space_name = message
+        .get("space_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.post_to_google_chat requires space_name".to_owned(),
+            )
+        })?;
+    let text = message.get("text").and_then(Value::as_str).ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest("ctx.post_to_google_chat requires text".to_owned())
+    })?;
+    let thread_name = message
+        .get("args")
+        .and_then(|args| args.get("thread_name"))
+        .and_then(Value::as_str);
+
+    let path = google_chat_relay_path(space_name, "messages")?;
+
+    let mut body = json!({ "text": text });
+    if let Some(thread) = thread_name {
+        body["thread_name"] = json!(thread);
+    }
+
+    post_to_googlechatbot(
+        &path,
+        &body,
+        std::time::Duration::from_secs(30),
+        "google chat send failed",
+    )
+    .await
+}
+
+async fn google_chat_dm_setup(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let target_identity = message
+        .get("target_identity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(
+                "ctx.google_chat_dm_setup requires target_identity".to_owned(),
+            )
+        })?;
+    let path = google_chat_dm_setup_path(target_identity)?;
+
+    post_to_googlechatbot(
+        &path,
+        &json!({}),
+        std::time::Duration::from_secs(30),
+        "google chat dm setup failed",
+    )
+    .await
+}
+
+async fn post_google_chat_attachment(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let required = |key: &str| -> Result<String, WorkflowRuntimeError> {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!(
+                    "ctx.post_to_google_chat_attachment requires {key}"
+                ))
+            })
+    };
+    let space_name = required("space_name")?;
+    let filename = required("filename")?;
+    let content_base64 = required("content_base64")?;
+    let arg = |key: &str| {
+        message
+            .get("args")
+            .and_then(|args| args.get(key))
+            .and_then(Value::as_str)
+    };
+
+    let path = google_chat_relay_path(&space_name, "attachments")?;
+
+    let mut body = json!({
+        "filename": filename,
+        "content_base64": content_base64,
+    });
+    for key in ["mime_type", "text", "thread_name"] {
+        if let Some(value) = arg(key) {
+            body[key] = json!(value);
+        }
+    }
+
+    post_to_googlechatbot(
+        &path,
+        &body,
+        std::time::Duration::from_secs(120),
+        "google chat attachment upload failed",
+    )
+    .await
 }
 
 fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostResult {
@@ -5106,6 +5623,183 @@ mod tests {
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 6, 16, 12, 30, 0).unwrap());
     }
 
+    fn dwd_broker_config(internal_url: String) -> GoogleChatDwdBrokerConfig {
+        GoogleChatDwdBrokerConfig {
+            enabled: true,
+            subjects: BTreeSet::from(["alice@example.com".to_owned()]),
+            internal_url,
+            internal_key: "internal-test-key".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_host_process_does_not_receive_google_chat_credentials() {
+        assert!(is_workflow_host_secret_env_key(
+            "PROD_GOOGLE_SERVICE_ACCOUNT_JSON"
+        ));
+        assert!(is_workflow_host_secret_env_key(
+            "PROD_GOOGLECHATBOT_INTERNAL_API_KEY"
+        ));
+        assert!(!is_workflow_host_secret_env_key(
+            "GOOGLE_CHAT_DWD_DM_SUBJECTS"
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s|%s' \"${GOOGLE_SERVICE_ACCOUNT_JSON-unset}\" \"${GOOGLECHATBOT_INTERNAL_API_KEY-unset}\"",
+            ])
+            .env("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account-secret")
+            .env("GOOGLECHATBOT_INTERNAL_API_KEY", "internal-secret");
+        scrub_workflow_host_secret_env(&mut command);
+
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"unset|unset");
+    }
+
+    #[test]
+    fn google_chat_dwd_broker_rejects_unlisted_subjects_and_unbound_resources() {
+        let config = dwd_broker_config("http://127.0.0.1:1".to_owned());
+        assert!(ensure_google_chat_dwd_workflow("google_chat_sync").is_ok());
+        assert!(ensure_google_chat_dwd_workflow("untrusted_workflow").is_err());
+        for message in [
+            json!({
+                "subject": "mallory@example.com",
+                "operation": "list_spaces",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": "Alice@example.com",
+                "operation": "list_spaces",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": "alice@example.com",
+                "operation": "list_messages",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": "alice@example.com",
+                "operation": "get_message",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": "mallory@example.com",
+                "operation": "list_reactions",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
+                "subject": " ",
+                "operation": "list_reactions",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+            json!({
+                "operation": "list_reactions",
+                "resource_name": "spaces/A/messages/M",
+                "page_size": 100,
+            }),
+        ] {
+            let error = parse_google_chat_dwd_read(&message, &config).unwrap_err();
+            assert!(!error.to_string().contains("internal-test-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn google_chat_dwd_broker_forwards_only_validated_bounded_reads() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"messages\":[]}",
+                    )
+                    .unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+        let message = json!({
+            "subject": "alice@example.com",
+            "operation": "list_messages",
+            "resource_name": "spaces/A",
+            "page_size": 100,
+            "page_token": "next/page",
+            "filter": "createTime > \"2026-08-01T00:00:00Z\"",
+            "show_deleted": true,
+        });
+        let value = google_chat_dwd_read_with_config(
+            &message,
+            &dwd_broker_config(format!("http://{address}")),
+        )
+        .await
+        .unwrap();
+        let reaction = json!({
+            "subject": "alice@example.com",
+            "operation": "list_reactions",
+            "resource_name": "spaces/A/messages/M",
+            "page_size": 100,
+        });
+        let reaction_value = google_chat_dwd_read_with_config(
+            &reaction,
+            &dwd_broker_config(format!("http://{address}")),
+        )
+        .await
+        .unwrap();
+        let fixed_reaction = json!({
+            "subject": "",
+            "operation": "list_reactions",
+            "resource_name": "spaces/A/messages/M",
+            "page_size": 100,
+        });
+        let mut fixed_reaction_config = dwd_broker_config(format!("http://{address}"));
+        fixed_reaction_config.enabled = false;
+        let fixed_reaction_value =
+            google_chat_dwd_read_with_config(&fixed_reaction, &fixed_reaction_config)
+                .await
+                .unwrap();
+        let requests = server.join().unwrap();
+        let request = requests[0].to_ascii_lowercase();
+        let reaction_request = requests[1].to_ascii_lowercase();
+        let fixed_reaction_request = requests[2].to_ascii_lowercase();
+
+        assert_eq!(value, json!({"messages": []}));
+        assert_eq!(reaction_value, json!({"messages": []}));
+        assert_eq!(fixed_reaction_value, json!({"messages": []}));
+        assert!(request.starts_with("get /api/chat/spaces/a/messages?"));
+        assert!(request.contains("page_size=100"));
+        assert!(request.contains("page_token=next%2fpage"));
+        assert!(request.contains("show_deleted=true"));
+        assert!(request.contains("authorization: bearer internal-test-key"));
+        assert!(request.contains("x-centaur-google-chat-dwd-subject: alice@example.com"));
+        assert!(reaction_request.starts_with("get /api/chat/spaces/a/messages/m/reactions?"));
+        assert!(reaction_request.contains("authorization: bearer internal-test-key"));
+        assert!(reaction_request.contains("x-centaur-google-chat-dwd-subject: alice@example.com"));
+        assert!(fixed_reaction_request.starts_with("get /api/chat/spaces/a/messages/m/reactions?"));
+        assert!(fixed_reaction_request.contains("authorization: bearer internal-test-key"));
+        assert!(!fixed_reaction_request.contains("x-centaur-google-chat-dwd-subject:"));
+    }
+
     #[test]
     fn python_slack_payload_passes_reply_broadcast() {
         let payload = python_slack_message_payload(
@@ -5531,6 +6225,34 @@ mod tests {
         ] {
             let mut webhook = webhook_with_filter(filter);
             let error = normalize_webhook(&mut webhook).unwrap_err();
+            assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn google_chat_relay_paths_are_space_scoped() {
+        assert_eq!(
+            google_chat_relay_path("spaces/AAQA42QLdws", "messages").unwrap(),
+            "/api/chat/spaces/AAQA42QLdws/messages"
+        );
+        assert_eq!(
+            google_chat_relay_path("spaces/AAQA42QLdws", "attachments").unwrap(),
+            "/api/chat/spaces/AAQA42QLdws/attachments"
+        );
+        for space_name in ["", "AAQA42QLdws", "spaces/A/messages/M", "spaces/bad id"] {
+            let error = google_chat_relay_path(space_name, "messages").unwrap_err();
+            assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn google_chat_dm_setup_paths_url_encode_the_target_email() {
+        assert_eq!(
+            google_chat_dm_setup_path(" Person+Tag@Example.COM ").unwrap(),
+            "/api/chat/dms/setup?target_identity=person%2Btag%40example.com"
+        );
+        for target in ["", "person", "person@", "@example.com", "a b@example.com"] {
+            let error = google_chat_dm_setup_path(target).unwrap_err();
             assert!(matches!(error, WorkflowRuntimeError::BadRequest(_)));
         }
     }

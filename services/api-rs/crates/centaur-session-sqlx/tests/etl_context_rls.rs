@@ -29,6 +29,10 @@ struct VisibleRows {
     linear_issues: i64,
     linear_comments: i64,
     linear_checkpoints: i64,
+    google_chat_spaces: Vec<String>,
+    google_chat_messages: Vec<String>,
+    google_chat_runs: i64,
+    google_chat_checkpoints: i64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -179,12 +183,120 @@ async fn company_context_reader_public_membership_does_not_grant_channel_access(
     fixture.finish(result).await
 }
 
+#[tokio::test]
+async fn google_chat_attachment_reaction_and_dm_owner_rls() -> Result<(), Box<dyn Error>> {
+    let Some(mut fixture) = RlsTestFixture::create().await? else {
+        return Ok(());
+    };
+    let result = assert_google_chat_parity_rls(&mut fixture.conn).await;
+    fixture.finish(result).await
+}
+
+async fn assert_google_chat_parity_rls(conn: &mut PgConnection) -> Result<(), Box<dyn Error>> {
+    // Read identity comes from the indexed source user, never a caller-supplied email.
+    sqlx::query("insert into slack_sync_users (user_id, team_id, raw_payload) values ('U_CHAT_OWNER', 'T_CHAT', '{\"profile\":{\"email\":\"alice@example.com\"}}')")
+        .execute(&mut *conn).await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_spaces ",
+        "(owner_email,space_id,space_name,space_type,participant_emails) values ",
+        "('alice@example.com','DM_SHARED','spaces/DM_SHARED','DIRECT_MESSAGE',",
+        "array['alice@example.com','bob@example.com']),",
+        "('bob@example.com','DM_SHARED','spaces/DM_SHARED','DIRECT_MESSAGE',",
+        "array['alice@example.com','bob@example.com'])",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into company_context_documents ",
+        "(document_id,source,source_type,source_document_id,metadata) values ",
+        "('doc_chat_alpha','google_chat','google_chat_thread','SPACE_ALPHA:T',",
+        "'{\"space_id\":\"SPACE_ALPHA\"}'),",
+        "('doc_chat_beta','google_chat','google_chat_thread','SPACE_BETA:T',",
+        "'{\"space_id\":\"SPACE_BETA\"}')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_messages ",
+        "(owner_email,space_id,message_id,message_name,text_content) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','spaces/DM_SHARED/messages/M_ALICE','a'),",
+        "('bob@example.com','DM_SHARED','M_BOB','spaces/DM_SHARED/messages/M_BOB','b')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_attachments ",
+        "(owner_email,space_id,message_id,attachment_id,content_name) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','A_ALICE','alice.txt'),",
+        "('bob@example.com','DM_SHARED','M_BOB','A_BOB','bob.txt')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(concat!(
+        "insert into google_chat_sync_reactions ",
+        "(owner_email,space_id,message_id,reaction_id,emoji_unicode) values ",
+        "('alice@example.com','DM_SHARED','M_ALICE','R_ALICE','👍'),",
+        "('bob@example.com','DM_SHARED','M_BOB','R_BOB','✅')",
+    ))
+    .execute(&mut *conn)
+    .await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("set local role centaur_slack_reader").await?;
+    sqlx::query("select set_config('centaur.slack_team_id', 'T_CHAT', true), set_config('centaur.slack_user_id', 'U_CHAT_OWNER', true)")
+        .execute(&mut *tx)
+        .await?;
+    let messages: Vec<String> = sqlx::query_scalar(concat!(
+        "select message_id from google_chat_sync_messages ",
+        "where space_id='DM_SHARED' order by message_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    let attachments: Vec<String> = sqlx::query_scalar(concat!(
+        "select attachment_id from google_chat_sync_attachments ",
+        "where space_id='DM_SHARED' order by attachment_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    let reactions: Vec<String> = sqlx::query_scalar(concat!(
+        "select reaction_id from google_chat_sync_reactions ",
+        "where space_id='DM_SHARED' order by reaction_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    assert_eq!(messages, vec!["M_ALICE"]);
+    assert_eq!(attachments, vec!["A_ALICE"]);
+    assert_eq!(reactions, vec!["R_ALICE"]);
+    let delete_error =
+        sqlx::query("delete from google_chat_sync_messages where space_id='DM_SHARED'")
+            .execute(&mut *tx)
+            .await
+            .expect_err("reader role must not delete Google Chat derived rows");
+    assert!(delete_error.to_string().contains("permission denied"));
+    tx.rollback().await?;
+
+    let mut tx = conn.begin().await?;
+    tx.execute("set local role centaur_slack_reader").await?;
+    sqlx::query("select set_config('centaur.google_chat_space_id', 'SPACE_ALPHA', true)")
+        .execute(&mut *tx)
+        .await?;
+    let docs: Vec<String> = sqlx::query_scalar(concat!(
+        "select document_id from company_context_documents where source='google_chat' ",
+        "order by document_id",
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    assert_eq!(docs, vec!["doc_chat_alpha"]);
+    tx.rollback().await?;
+    Ok(())
+}
+
 async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dyn Error>> {
     assert_rls_enabled(conn).await?;
     assert_expected_policies(conn).await?;
     assert_legacy_admin_state_is_removed(conn).await?;
 
-    let c_alpha = visible_rows(conn, "centaur_slack_reader", Some("C_ALPHA")).await?;
+    let c_alpha = visible_rows(conn, "centaur_slack_reader", Some("C_ALPHA"), None).await?;
     assert_eq!(
         c_alpha,
         VisibleRows {
@@ -205,10 +317,14 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
 
-    let c_beta = visible_rows(conn, "centaur_slack_reader", Some("C_BETA")).await?;
+    let c_beta = visible_rows(conn, "centaur_slack_reader", Some("C_BETA"), None).await?;
     assert_eq!(
         c_beta,
         VisibleRows {
@@ -229,17 +345,21 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
 
-    let dm_or_missing_channel = visible_rows(conn, "centaur_slack_reader", Some("")).await?;
+    let dm_or_missing_channel = visible_rows(conn, "centaur_slack_reader", Some(""), None).await?;
     assert_eq!(dm_or_missing_channel, empty_visible_rows());
 
-    let unset_channel = visible_rows(conn, "centaur_slack_reader", None).await?;
+    let unset_channel = visible_rows(conn, "centaur_slack_reader", None, None).await?;
     assert_eq!(unset_channel, empty_visible_rows());
 
     let formerly_admin_channel =
-        visible_rows(conn, "centaur_slack_reader", Some("C_ADMIN")).await?;
+        visible_rows(conn, "centaur_slack_reader", Some("C_ADMIN"), None).await?;
     assert_eq!(
         formerly_admin_channel,
         VisibleRows {
@@ -260,8 +380,71 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
             linear_issues: 0,
             linear_comments: 0,
             linear_checkpoints: 0,
+            google_chat_spaces: vec![],
+            google_chat_messages: vec![],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
         }
     );
+
+    let space_alpha = visible_rows(conn, "centaur_slack_reader", None, Some("SPACE_ALPHA")).await?;
+    assert_eq!(
+        space_alpha,
+        VisibleRows {
+            slack_channels: vec![],
+            slack_users: vec![],
+            slack_messages: vec![],
+            slack_attachments: vec![],
+            context_docs: vec![],
+            google_drive_runs: 0,
+            google_drive_files: 0,
+            google_drive_checkpoints: 0,
+            google_calendar_runs: 0,
+            google_calendar_calendars: 0,
+            google_calendar_events: 0,
+            google_calendar_checkpoints: 0,
+            linear_runs: 0,
+            linear_projects: 0,
+            linear_issues: 0,
+            linear_comments: 0,
+            linear_checkpoints: 0,
+            google_chat_spaces: vec!["SPACE_ALPHA".to_owned()],
+            google_chat_messages: vec!["SPACE_ALPHA:msg_alpha".to_owned()],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
+        }
+    );
+
+    let space_beta = visible_rows(conn, "centaur_slack_reader", None, Some("SPACE_BETA")).await?;
+    assert_eq!(
+        space_beta,
+        VisibleRows {
+            slack_channels: vec![],
+            slack_users: vec![],
+            slack_messages: vec![],
+            slack_attachments: vec![],
+            context_docs: vec![],
+            google_drive_runs: 0,
+            google_drive_files: 0,
+            google_drive_checkpoints: 0,
+            google_calendar_runs: 0,
+            google_calendar_calendars: 0,
+            google_calendar_events: 0,
+            google_calendar_checkpoints: 0,
+            linear_runs: 0,
+            linear_projects: 0,
+            linear_issues: 0,
+            linear_comments: 0,
+            linear_checkpoints: 0,
+            google_chat_spaces: vec!["SPACE_BETA".to_owned()],
+            google_chat_messages: vec!["SPACE_BETA:msg_beta".to_owned()],
+            google_chat_runs: 0,
+            google_chat_checkpoints: 0,
+        }
+    );
+
+    let missing_space = visible_rows(conn, "centaur_slack_reader", None, Some("")).await?;
+    assert_eq!(missing_space, empty_visible_rows());
 
     Ok(())
 }
@@ -600,6 +783,14 @@ fn expected_policies() -> Vec<(String, String)> {
         (
             "linear_sync_checkpoints",
             "centaur_linear_checkpoints_reader_select",
+        ),
+        (
+            "google_chat_sync_spaces",
+            "centaur_google_chat_spaces_reader_select",
+        ),
+        (
+            "google_chat_sync_messages",
+            "centaur_google_chat_messages_reader_select",
         ),
     ]
     .into_iter()
@@ -1321,6 +1512,17 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
         insert into linear_sync_comments (comment_id) values ('linear_comment');
         insert into linear_sync_checkpoints (scope_id) values ('linear_scope');
 
+        insert into google_chat_sync_runs (run_id, status) values ('gchat_run', 'succeeded');
+        insert into google_chat_sync_spaces (space_id) values
+            ('SPACE_ALPHA'),
+            ('SPACE_BETA');
+        insert into google_chat_sync_messages (space_id, message_id) values
+            ('SPACE_ALPHA', 'msg_alpha'),
+            ('SPACE_BETA', 'msg_beta');
+        insert into google_chat_sync_checkpoints (space_id) values
+            ('SPACE_ALPHA'),
+            ('SPACE_BETA');
+
         insert into google_docs_sync_runs
             (run_id, status, broker_credential_id, provider_subject, provider_email)
         values
@@ -1394,6 +1596,7 @@ async fn visible_rows(
     conn: &mut PgConnection,
     role: &str,
     slack_channel_id: Option<&str>,
+    google_chat_space_id: Option<&str>,
 ) -> Result<VisibleRows, sqlx::Error> {
     let mut tx = conn.begin().await?;
     tx.execute("set local search_path to public").await?;
@@ -1401,6 +1604,12 @@ async fn visible_rows(
     if let Some(channel_id) = slack_channel_id {
         sqlx::query("select set_config('centaur.slack_channel_id', $1, true)")
             .bind(channel_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if let Some(space_id) = google_chat_space_id {
+        sqlx::query("select set_config('centaur.google_chat_space_id', $1, true)")
+            .bind(space_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -1443,6 +1652,18 @@ async fn visible_rows(
         linear_issues: count(&mut tx, "linear_sync_issues").await?,
         linear_comments: count(&mut tx, "linear_sync_comments").await?,
         linear_checkpoints: count(&mut tx, "linear_sync_checkpoints").await?,
+        google_chat_spaces: text_array(
+            &mut tx,
+            "select coalesce(array_agg(space_id order by space_id), '{}') from google_chat_sync_spaces",
+        )
+        .await?,
+        google_chat_messages: text_array(
+            &mut tx,
+            "select coalesce(array_agg(space_id || ':' || message_id order by space_id, message_id), '{}') from google_chat_sync_messages",
+        )
+        .await?,
+        google_chat_runs: count(&mut tx, "google_chat_sync_runs").await?,
+        google_chat_checkpoints: count(&mut tx, "google_chat_sync_checkpoints").await?,
     };
 
     tx.execute("reset role").await?;
@@ -1781,5 +2002,9 @@ fn empty_visible_rows() -> VisibleRows {
         linear_issues: 0,
         linear_comments: 0,
         linear_checkpoints: 0,
+        google_chat_spaces: vec![],
+        google_chat_messages: vec![],
+        google_chat_runs: 0,
+        google_chat_checkpoints: 0,
     }
 }

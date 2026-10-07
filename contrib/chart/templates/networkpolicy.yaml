@@ -81,6 +81,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.googlechatbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 14 }}
+{{- end }}
 {{- if .Values.teamsbot.enabled }}
         - podSelector:
             matchLabels:
@@ -172,6 +177,11 @@ spec:
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.googlechatbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 14 }}
 {{- end }}
 {{- if .Values.teamsbot.enabled }}
         - podSelector:
@@ -334,6 +344,17 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
+{{- if .Values.googlechatbot.enabled }}
+    # Workflow deliveries: api-rs (centaur-workflows) POSTs scheduled task
+    # results to the Google Chat bot's internal API.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- end }}
     - ports:
         - protocol: TCP
           port: 443
@@ -506,6 +527,59 @@ spec:
     {{- include "centaur.postgresEgress" . | nindent 4 }}
     # Discord Gateway (wss), REST, and CDN all need direct HTTPS egress. The Gateway cannot be
     # proxied (discord.js ignores HTTPS_PROXY), so this rule is load-bearing.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.googlechatbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Inbound Google Chat webhooks arrive through the ingress controller, plus health probes.
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- if .Values.apiRs.enabled }}
+    # Internal Google Chat operations are accepted only from api-rs. Sandboxes
+    # call api-rs and are never admitted directly to this service.
+    - from:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3002
+{{- end }}
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Google Chat REST API + OAuth2 token endpoint (direct HTTPS).
     - ports:
         - protocol: TCP
           port: 443

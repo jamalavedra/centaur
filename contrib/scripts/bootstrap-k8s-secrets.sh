@@ -200,6 +200,18 @@ if secret_exists centaur-infra-env; then
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     patch_data+=("\"OP_CONNECT_TOKEN\":\"$(printf '%s' "$OP_CONNECT_TOKEN" | base64 | tr -d '\n')\"")
   fi
+  # Google Chat ingress (googlechatbot) keys: added when GOOGLE_SERVICE_ACCOUNT_JSON is in the
+  # env. The service account is overwritten on each run (so rotation works); the api-rs ingress
+  # bearer and the api-rs -> googlechatbot internal key are generated once if absent.
+  if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
+    patch_data+=("\"GOOGLE_SERVICE_ACCOUNT_JSON\":\"$(printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | base64 | tr -d '\n')\"")
+    if ! secret_key_present GOOGLECHATBOT_API_KEY; then
+      patch_data+=("\"GOOGLECHATBOT_API_KEY\":\"$(printf '%s' "${GOOGLECHATBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
+    if ! secret_key_present GOOGLECHATBOT_INTERNAL_API_KEY; then
+      patch_data+=("\"GOOGLECHATBOT_INTERNAL_API_KEY\":\"$(printf '%s' "${GOOGLECHATBOT_INTERNAL_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
+  fi
   # GITHUB_TOKEN for the repo-cache DaemonSet. Set whenever present so it can be
   # rotated; harmless when repoCache is disabled.
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -342,6 +354,11 @@ else
   fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
+  fi
+  if [[ -n "${GOOGLE_SERVICE_ACCOUNT_JSON:-}" ]]; then
+    secret_args+=(--from-literal=GOOGLE_SERVICE_ACCOUNT_JSON="$GOOGLE_SERVICE_ACCOUNT_JSON")
+    secret_args+=(--from-literal=GOOGLECHATBOT_API_KEY="${GOOGLECHATBOT_API_KEY:-$(rand_hex)}")
+    secret_args+=(--from-literal=GOOGLECHATBOT_INTERNAL_API_KEY="${GOOGLECHATBOT_INTERNAL_API_KEY:-$(rand_hex)}")
   fi
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")

@@ -117,12 +117,12 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
 
 /// The chat surface a thread is delivered to, parsed from its thread key.
 ///
-/// Slack, Discord, Linear, and GitHub all encode the destination — where a reply
-/// (and, where the surface supports it, an uploaded file) lands — directly in the
-/// key. Resolving it in one place lets the API session context, the per-turn
-/// context line the agent reads, and any caller that needs a posting destination
-/// share a single parser instead of each re-deriving the platform from the key
-/// shape.
+/// Slack, Discord, Linear, GitHub, and Google Chat all encode the destination —
+/// where a reply (and, where the surface supports it, an uploaded file) lands —
+/// directly in the key. Resolving it in one place lets the API session context,
+/// the per-turn context line the agent reads, and any caller that needs a
+/// posting destination share a single parser instead of each re-deriving the
+/// platform from the key shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatDestination {
     Slack {
@@ -153,6 +153,13 @@ pub enum ChatDestination {
         kind: GithubThreadKind,
         review_comment_id: Option<u64>,
     },
+    /// A Google Chat space thread. `space_name` and `thread_name` are Chat API
+    /// resource names (`spaces/{id}` and `spaces/{id}/threads/{id}`), recovered
+    /// from the `chat:spaces:...` thread-key encoding the googlechatbot uses.
+    GoogleChat {
+        space_name: String,
+        thread_name: String,
+    },
 }
 
 /// Whether a GitHub thread maps to an issue or a pull request.
@@ -180,6 +187,7 @@ impl ChatDestination {
             Self::Discord { .. } => "discord",
             Self::Linear { .. } => "linear",
             Self::Github { .. } => "github",
+            Self::GoogleChat { .. } => "google_chat",
         }
     }
 
@@ -257,6 +265,14 @@ impl ChatDestination {
                      GitHub replies are markdown comments with no file-upload surface; share artifacts inline or as a link.]"
                 )
             }
+            Self::GoogleChat {
+                space_name,
+                thread_name,
+            } => format!(
+                "[chat surface: Google Chat · space {space_name} · thread {thread_name}. \
+                 Centaur delivers your reply to this thread automatically — do not repost it with the google-chat tool. \
+                 Send files here with `google-chat upload`.]"
+            ),
         }
     }
 }
@@ -271,10 +287,12 @@ impl ThreadKey {
     /// session-context parser so existing Slack behavior is preserved; Discord
     /// keys are `discord:<guild>:<channel>[:<thread>]`, Linear keys are
     /// `linear:<issue>[:c:<comment>][:s:<agent_session>]` (mirroring the
-    /// linearbot chat-SDK `encodeThreadId` shape), and GitHub keys are
+    /// linearbot chat-SDK `encodeThreadId` shape), GitHub keys are
     /// `github:<owner>/<repo>:<pr>[:rc:<review_comment>]` or
     /// `github:<owner>/<repo>:issue:<issue>` (mirroring githubbot's
-    /// `parseGithubThreadKey`).
+    /// `parseGithubThreadKey`), and Google Chat keys are
+    /// `chat:spaces:<space_id>:<thread_resource_segments...>` (the googlechatbot
+    /// rewrites `/` to `:` in each Chat API resource name it embeds).
     pub fn chat_destination(&self) -> Option<ChatDestination> {
         let key = self.as_str();
         if let Some(rest) = key.strip_prefix("github:") {
@@ -335,6 +353,18 @@ impl ThreadKey {
                 agent_session_id: agent_session_id
                     .filter(|s| !s.is_empty())
                     .map(ToOwned::to_owned),
+            });
+        }
+        if let Some(rest) = key.strip_prefix("chat:spaces:") {
+            let mut segments = rest.split(':');
+            let space_id = segments.next().filter(|space| !space.is_empty())?;
+            let thread_name = segments.collect::<Vec<_>>().join("/");
+            if thread_name.is_empty() {
+                return None;
+            }
+            return Some(ChatDestination::GoogleChat {
+                space_name: format!("spaces/{space_id}"),
+                thread_name,
             });
         }
         let parts = key.split(':').collect::<Vec<_>>();
@@ -740,6 +770,31 @@ mod tests {
     }
 
     #[test]
+    fn chat_destination_resolves_google_chat_keys() {
+        let dest = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            dest,
+            ChatDestination::GoogleChat {
+                space_name: "spaces/AAAA".to_owned(),
+                thread_name: "spaces/AAAA/threads/BBBB".to_owned(),
+            }
+        );
+        assert_eq!(dest.platform(), "google_chat");
+
+        // A key that starts with `chat:` but not `chat:spaces:` is not a
+        // recognized Google Chat (or any other) destination.
+        assert!(
+            ThreadKey::parse("chat:C123:123.456")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn chat_destination_is_none_for_unaddressable_keys() {
         // No channel id → not a postable Discord destination.
         assert!(
@@ -850,6 +905,19 @@ mod tests {
             .unwrap()
             .context_line();
         assert!(github_issue.contains("issue 0xSplits/centaur#12"));
+
+        let google_chat = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(google_chat.contains("Google Chat"));
+        assert!(google_chat.contains("spaces/AAAA/threads/BBBB"));
+        // The shim is generated from `[project.scripts]` in
+        // tools/comms/google_chat/pyproject.toml, which names it `google-chat`.
+        // `google_chat upload` is not a command that exists in the sandbox.
+        assert!(google_chat.contains("google-chat upload"));
+        assert!(!google_chat.contains("google_chat upload"));
     }
 
     #[test]

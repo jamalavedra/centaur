@@ -29,6 +29,9 @@ DEFAULT_MAX_WINDOW_SECONDS = 6 * 60 * 60
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_SCOPE_LEASE_SECONDS = 20 * 60
 MIN_THREAD_MESSAGES = 5
+# Google Chat threads are often short; project every thread with at least one
+# message so single-message rooms are not dropped from the corpus.
+MIN_CHAT_THREAD_MESSAGES = 1
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
 SLACK_CHANNEL_RE = re.compile(r"<#([A-Z0-9]+)(?:\|([^>]+))?>")
@@ -36,6 +39,7 @@ COMPANY_CONTEXT_SOURCE_TYPES = {
     "slack": ("slack_channel_day", "slack_thread", "slack_attachment"),
     "google_drive": ("google_doc",),
     "google_calendar": ("calendar_event",),
+    "google_chat": ("google_chat_thread", "google_chat_attachment"),
     "linear": ("linear_issue",),
     "attio": ("attio_meeting",),
 }
@@ -43,6 +47,7 @@ COMPANY_CONTEXT_DOCUMENT_ACTIONS = ("inserted", "updated", "deleted", "noop")
 ETL_CHECKPOINT_TABLES = {
     "google_drive": "google_drive_sync_checkpoints",
     "google_calendar": "google_calendar_sync_checkpoints",
+    "google_chat": "google_chat_sync_checkpoints",
     "linear": "linear_sync_checkpoints",
     "attio": "attio_sync_checkpoints",
 }
@@ -85,6 +90,7 @@ SCHEDULE = {
             _env_flag_enabled("SLACK_ETL_ENABLED")
             or _env_flag_enabled("GOOGLE_DRIVE_ETL_ENABLED")
             or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
+            or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
             or _env_flag_enabled("LINEAR_ETL_ENABLED")
             or _env_flag_enabled("ATTIO_ETL_ENABLED")
         )
@@ -228,6 +234,7 @@ def _source_enabled() -> bool:
         _env_flag_enabled("SLACK_ETL_ENABLED")
         or _env_flag_enabled("GOOGLE_DRIVE_ETL_ENABLED")
         or _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED")
+        or _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED")
         or _env_flag_enabled("LINEAR_ETL_ENABLED")
         or _env_flag_enabled("ATTIO_ETL_ENABLED")
     )
@@ -1400,6 +1407,199 @@ def _calendar_event_document_id(row: Any) -> str:
     return f"google_calendar:event:{calendar_id}:{event_id}"
 
 
+async def _load_changed_chat_threads(
+    pool,
+    since: dt.datetime | None,
+    until: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Find Google Chat threads affected by changed message rows."""
+    where_sql, args = _updated_at_where(
+        "updated_at",
+        since,
+        until,
+        base_clauses=("owner_email = ''", "last_error = ''", "thread_id <> ''"),
+    )
+
+    thread_rows = await pool.fetch(
+        "SELECT DISTINCT space_id, thread_id "
+        f"FROM google_chat_sync_messages {where_sql} "
+        "ORDER BY space_id, thread_id",
+        *args,
+    )
+    stats = await pool.fetchrow(
+        "SELECT COUNT(*) AS changed_messages, MAX(updated_at) AS max_updated_at "
+        f"FROM google_chat_sync_messages {where_sql}",
+        *args,
+    )
+    max_updated_at = stats["max_updated_at"] if stats else None
+    if isinstance(max_updated_at, dt.datetime):
+        max_updated_at = max_updated_at.astimezone(dt.timezone.utc)
+    return {
+        "threads": [
+            (str(row["space_id"]), str(row["thread_id"])) for row in thread_rows
+        ],
+        "changed_messages": int(stats["changed_messages"] or 0) if stats else 0,
+        "max_updated_at": max_updated_at,
+    }
+
+
+async def _load_chat_thread_messages(pool, space_id: str, thread_id: str) -> list[Any]:
+    """Load all messages for one Google Chat thread aggregate."""
+    return list(
+        await pool.fetch(
+            "SELECT m.space_id, s.display_name AS space_display_name, s.space_type, "
+            "m.message_id, m.message_name, m.thread_id, m.sender_id, m.sender_name, "
+            "m.sender_type, m.text_content, m.source_create_time, m.updated_at, "
+            "COALESCE((SELECT string_agg(a.content_name || CASE WHEN a.content_text = '' "
+            "THEN '' ELSE ': ' || a.content_text END, E'\\n' ORDER BY a.attachment_id) "
+            "FROM google_chat_sync_attachments a WHERE a.owner_email = m.owner_email "
+            "AND a.space_id=m.space_id AND a.message_id=m.message_id), '') attachment_context, "
+            "COALESCE((SELECT string_agg(COALESCE(NULLIF(r.emoji_unicode, ''), "
+            "r.custom_emoji_uid), ', ' ORDER BY r.reaction_id) "
+            "FROM google_chat_sync_reactions r WHERE r.owner_email = m.owner_email "
+            "AND r.space_id=m.space_id AND r.message_id=m.message_id), '') reaction_context "
+            "FROM google_chat_sync_messages m "
+            "LEFT JOIN google_chat_sync_spaces s ON s.owner_email=m.owner_email "
+            "AND s.space_id = m.space_id "
+            "WHERE m.owner_email = '' AND m.space_id = $1 AND m.thread_id = $2 "
+            "AND m.last_error = '' "
+            "ORDER BY m.source_create_time NULLS LAST, m.message_id",
+            space_id,
+            thread_id,
+        )
+    )
+
+
+def _chat_speaker(row: Any) -> str:
+    """Return the best display name for a Google Chat sender row."""
+    name = str(row["sender_name"] or "").strip()
+    if name:
+        return name
+    return str(row["sender_id"] or "").strip() or "Unknown"
+
+
+def _optional_row_text(row: Any, key: str) -> str:
+    try:
+        return str(row[key] or "").strip()
+    except (KeyError, TypeError):
+        return ""
+
+
+def _google_chat_thread_document(
+    *,
+    space_id: str,
+    thread_id: str,
+    messages: list[Any],
+) -> dict[str, Any] | None:
+    """Render one Google Chat thread into a context document."""
+    if len(messages) < MIN_CHAT_THREAD_MESSAGES:
+        return None
+
+    first = messages[0]
+    space_name = str(first["space_display_name"] or space_id)
+    first_text = str(first["text_content"] or "").strip()
+    title = (
+        _sanitize_heading(first_text)
+        if first_text
+        else f"Chat thread in {space_name}"
+    )
+    participants = sorted(
+        {_chat_speaker(row) for row in messages if str(row["sender_id"] or "")}
+    )
+    last_updated = max(
+        row["updated_at"].astimezone(dt.timezone.utc) for row in messages
+    )
+    occurred_at = first["source_create_time"]
+
+    lines = [
+        f"# {title}",
+        "",
+        "- Source: Google Chat",
+        f"- Space: {space_name}",
+        f"- Started: {_format_time(occurred_at)}",
+        f"- Participants: {', '.join(participants)}",
+        f"- Messages: {len(messages)}",
+        "",
+        "---",
+        "",
+    ]
+    for row in messages:
+        speaker = _chat_speaker(row)
+        text = str(row["text_content"] or "").strip()
+        attachments = _optional_row_text(row, "attachment_context")
+        reactions = _optional_row_text(row, "reaction_context")
+        lines.extend(
+            [
+                f"### {speaker} - {_format_time(row['source_create_time'])}",
+                "",
+                text,
+                *([f"Attachments: {attachments}"] if attachments else []),
+                *([f"Reactions: {reactions}"] if reactions else []),
+                "",
+            ]
+        )
+
+    body = "\n".join(lines).strip()
+    source_document_id = f"{space_id}:{thread_id}"
+    metadata = {
+        "space_id": space_id,
+        "space_name": space_name,
+        "space_type": str(first["space_type"] or ""),
+        "thread_id": thread_id,
+        "message_count": len(messages),
+        "participants": participants,
+        "aggregation": "thread",
+    }
+    return {
+        "document_id": f"google_chat:thread:{space_id}:{thread_id}",
+        "source": "google_chat",
+        "source_type": "google_chat_thread",
+        "source_document_id": source_document_id,
+        "source_chunk_id": "",
+        "parent_document_id": None,
+        "title": title,
+        "body": body,
+        "url": "",
+        "author_id": str(first["sender_id"] or ""),
+        "author_name": _chat_speaker(first),
+        "access_scope": "company",
+        "occurred_at": occurred_at,
+        "source_updated_at": last_updated,
+        "content_hash": _content_hash(title, body, "", metadata),
+        "metadata": metadata,
+    }
+
+
+def _google_chat_attachment_document(row: Any) -> dict[str, Any]:
+    title = str(row["content_name"] or row["attachment_id"])
+    body = str(row["content_text"] or "").strip() or f"Google Chat attachment: {title}"
+    metadata = {
+        "space_id": str(row["space_id"]),
+        "message_id": str(row["message_id"]),
+        "attachment_id": str(row["attachment_id"]),
+        "content_type": str(row["content_type"] or ""),
+    }
+    source_document_id = (
+        f"{row['space_id']}:{row['message_id']}:{row['attachment_id']}"
+    )
+    return {
+        "document_id": f"google_chat:attachment:{source_document_id}",
+        "source": "google_chat",
+        "source_type": "google_chat_attachment",
+        "source_document_id": source_document_id,
+        "source_chunk_id": "",
+        "parent_document_id": None,
+        "title": title,
+        "body": body,
+        "url": str(row["source_uri"] or row["download_uri"] or ""),
+        "author_id": str(row["sender_id"] or ""),
+        "author_name": str(row["sender_name"] or ""),
+        "access_scope": "company",
+        "occurred_at": row["source_create_time"],
+        "source_updated_at": row["updated_at"],
+        "content_hash": _content_hash(title, body, "", metadata),
+        "metadata": metadata,
+    }
 async def _upsert_document(pool, document: dict[str, Any]) -> str:
     """Upsert a projected document and return inserted/updated/noop."""
     existing_hash = await pool.fetchval(
@@ -1491,6 +1691,13 @@ def _enabled_scopes() -> dict[str, str]:
         scopes["google_doc"] = "google_drive"
     if _env_flag_enabled("GOOGLE_CALENDAR_ETL_ENABLED"):
         scopes["calendar_event"] = "google_calendar"
+    if _env_flag_enabled("GOOGLE_CHAT_ETL_ENABLED"):
+        scopes.update(
+            {
+                "google_chat_thread": "google_chat",
+                "google_chat_attachment": "google_chat",
+            }
+        )
     if _env_flag_enabled("LINEAR_ETL_ENABLED"):
         # Comments have their own cursor because updating a comment does not update
         # the parent issue row's synced timestamp.
@@ -1670,6 +1877,34 @@ async def _load_scope_page(
             batch_size=batch_size,
             base=("last_error = ''",),
         )
+    if scope == "google_chat_thread":
+        return await _fetch_page(
+            pool,
+            table="google_chat_sync_messages",
+            column="updated_at",
+            key_expression="space_id || ':' || message_id",
+            key_alias="projection_key",
+            window_start=window_start,
+            window_end=window_end,
+            cursor_updated_at=cursor_updated_at,
+            cursor_key=cursor_key,
+            batch_size=batch_size,
+            base=("owner_email = ''", "last_error = ''", "thread_id <> ''"),
+        )
+    if scope == "google_chat_attachment":
+        return await _fetch_page(
+            pool,
+            table="google_chat_sync_attachments",
+            column="updated_at",
+            key_expression="space_id || ':' || message_id || ':' || attachment_id",
+            key_alias="projection_key",
+            window_start=window_start,
+            window_end=window_end,
+            cursor_updated_at=cursor_updated_at,
+            cursor_key=cursor_key,
+            batch_size=batch_size,
+            base=("owner_email = ''",),
+        )
     if scope == "linear_comment":
         return await _fetch_page(
             pool,
@@ -1814,6 +2049,42 @@ async def _project_scope_page(
             else:
                 await save(
                     _calendar_event_document(event), "google_calendar", "calendar_event"
+                )
+    elif scope == "google_chat_thread":
+        keys = {(str(row["space_id"]), str(row["thread_id"])) for row in rows}
+        for space_id, thread_id in keys:
+            document = _google_chat_thread_document(
+                space_id=space_id,
+                thread_id=thread_id,
+                messages=await _load_chat_thread_messages(pool, space_id, thread_id),
+            )
+            if document is None:
+                if await _delete_document(
+                    pool, f"google_chat:thread:{space_id}:{thread_id}"
+                ):
+                    deleted += 1
+                    record_company_context_documents_changed(
+                        "google_chat", "google_chat_thread", "deleted"
+                    )
+            else:
+                await save(document, "google_chat", "google_chat_thread")
+    elif scope == "google_chat_attachment":
+        for row in rows:
+            attachment = await pool.fetchrow(
+                "SELECT a.*, m.sender_id, m.sender_name, m.source_create_time "
+                "FROM google_chat_sync_attachments a JOIN google_chat_sync_messages m "
+                "ON m.owner_email=a.owner_email AND m.space_id=a.space_id "
+                "AND m.message_id=a.message_id WHERE a.owner_email='' AND a.space_id=$1 "
+                "AND a.message_id=$2 AND a.attachment_id=$3",
+                row["space_id"],
+                row["message_id"],
+                row["attachment_id"],
+            )
+            if attachment:
+                await save(
+                    _google_chat_attachment_document(attachment),
+                    "google_chat",
+                    "google_chat_attachment",
                 )
     elif scope in {"linear_issue", "linear_comment"}:
         issue_ids = {str(row["issue_id"]) for row in rows}

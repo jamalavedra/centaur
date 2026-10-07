@@ -338,6 +338,14 @@ const INGRESS_SPECS: &[IngressSpec] = &[
         platform_prefixes: &["teams:"],
         workflow_events: false,
     },
+    // Google Chat thread keys always start with `chat:spaces:`; other `chat:`
+    // keys belong to other ingresses and stay out of this caller's scope.
+    IngressSpec {
+        env_var: "GOOGLECHATBOT_API_KEY",
+        identity: "googlechatbot",
+        platform_prefixes: &["chat:spaces:"],
+        workflow_events: true,
+    },
 ];
 
 struct IngressSpec {

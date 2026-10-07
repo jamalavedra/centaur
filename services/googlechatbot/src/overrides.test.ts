@@ -1,0 +1,107 @@
+import { test, expect, describe } from 'bun:test'
+import { extractMessageOverrides, validateStrategyOverrides } from './overrides'
+
+describe('extractMessageOverrides', () => {
+  test('extracts --model and strips it from the prompt', () => {
+    const out = extractMessageOverrides('fix the bug --model gpt-5.2')
+    expect(out.model).toBe('gpt-5.2')
+    expect(out.cleanedText).toBe('fix the bug')
+  })
+
+  test('expands Claude aliases and implies the harness via shortcut flags', () => {
+    const out = extractMessageOverrides('--opus refactor this')
+    expect(out.model).toBe('claude-opus-5-5')
+    expect(out.harnessType).toBe('claudecode')
+    expect(out.cleanedText).toBe('refactor this')
+  })
+
+  test('recognizes --nanocodex as a harness flag', () => {
+    const out = extractMessageOverrides('--nanocodex review this')
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.cleanedText).toBe('review this')
+  })
+
+  test('recognizes --hermes as a harness flag', () => {
+    const out = extractMessageOverrides('--hermes review this')
+    expect(out.harnessType).toBe('hermes')
+    expect(out.cleanedText).toBe('review this')
+  })
+
+  test('extracts -rsn reasoning effort', () => {
+    const out = extractMessageOverrides('think hard -rsn high')
+    expect(out.reasoning).toBe('high')
+    expect(out.cleanedText).toBe('think hard')
+  })
+
+  test('--bedrock selects the provider and implies codex', () => {
+    const out = extractMessageOverrides('run it --bedrock')
+    expect(out.provider).toBe('amazon-bedrock')
+    expect(out.harnessType).toBe('codex')
+  })
+
+  test('--meta selects the responses provider and implies codex', () => {
+    const out = extractMessageOverrides('run it --meta')
+    expect(out.provider).toBe('responses')
+    expect(out.harnessType).toBe('codex')
+  })
+
+  test('stops the --model value at a trailing newline (prompt on next line)', () => {
+    const out = extractMessageOverrides('--model gpt-5.2\nfix the bug')
+    expect(out.model).toBe('gpt-5.2')
+    expect(out.cleanedText).toBe('fix the bug')
+  })
+
+  test('-rsn accepts the GPT-5.6 max effort', () => {
+    expect(extractMessageOverrides('-rsn max fix it').reasoning).toBe('max')
+  })
+
+  test('stops the -rsn value at a trailing newline', () => {
+    const out = extractMessageOverrides('-rsn high\nthink hard about this')
+    expect(out.reasoning).toBe('high')
+    expect(out.cleanedText).toBe('think hard about this')
+  })
+
+  test('leaves text untouched when no flags present', () => {
+    const out = extractMessageOverrides('just a normal message')
+    expect(out.cleanedText).toBe('just a normal message')
+    expect(out.model).toBeUndefined()
+  })
+})
+
+// Upstream #1595/#1599 parity: --persona pins the thread's persona at session
+// creation; gpt-6-astra adds the ultra effort level.
+describe('persona and astra flags', () => {
+  test('extracts --persona in both spellings and strips it from the prompt', () => {
+    expect(extractMessageOverrides('--persona eng fix the bug')).toMatchObject({
+      personaId: 'eng',
+      cleanedText: 'fix the bug'
+    })
+    expect(extractMessageOverrides('fix the bug --persona=sales.eu')).toMatchObject({
+      personaId: 'sales.eu',
+      cleanedText: 'fix the bug'
+    })
+  })
+
+  test('--persona composes with model flags and leaves plain text alone', () => {
+    const out = extractMessageOverrides('--claude --persona eng go')
+    expect(out.personaId).toBe('eng')
+    expect(out.harnessType).toBe('claudecode')
+    expect(out.cleanedText).toBe('go')
+    expect(extractMessageOverrides('the persona system').personaId).toBeUndefined()
+  })
+
+  test('-rsn ultra is a recognized effort', () => {
+    expect(extractMessageOverrides('go -rsn ultra').reasoning).toBe('ultra')
+  })
+})
+
+
+test('Pi flags and strategy preserve the selected harness and effort', () => {
+  expect(extractMessageOverrides('--pi --model gpt-6-sol -rsn high hello')).toMatchObject({
+    harnessType: 'pi', model: 'gpt-6-sol', reasoning: 'high', cleanedText: 'hello'
+  })
+  expect(validateStrategyOverrides({ harness: 'pi', model: 'gpt-6-sol', reasoning: 'high' })).toMatchObject({
+    harnessType: 'pi', model: 'gpt-6-sol', reasoning: 'high'
+  })
+  expect(validateStrategyOverrides({ harness: 'claudecode', reasoning: 'high' }).reasoning).toBe('high')
+})

@@ -1,0 +1,282 @@
+import { test, expect, describe } from 'bun:test'
+import {
+  CARD_FALLBACK_TEXT,
+  fenceMarkdownTables,
+  flattenCardProseInline,
+  markdownToChatMessage,
+  messageUtf8Bytes,
+  normalizeCardBreaks,
+  splitUtf8Text,
+  stripInlineMarkdown,
+  toChatTextMarkup
+} from './render'
+import { chatReplyLimits } from '../constants'
+
+type TextParagraph = { text: string; textSyntax?: 'MARKDOWN' | 'HTML' }
+
+function paragraphs(out: ReturnType<typeof markdownToChatMessage>): TextParagraph[] {
+  const widgets = (out.cardsV2 ?? []).flatMap((c) => c.card.sections ?? []).flatMap((s) => s.widgets ?? [])
+  return widgets.map((w) => w.textParagraph).filter((p): p is TextParagraph => Boolean(p))
+}
+
+describe('markdownToChatMessage', () => {
+  test('card prose is flattened so Chat cannot fragment inline spans; lists keep markdown', () => {
+    // Cards break EVERY inline span in a top-level paragraph onto its own line
+    // (probe cards posted live, 2026-07-06) — so card prose ships with inline
+    // markup removed. List items are exempt: their spans render correctly.
+    const out = markdownToChatMessage(
+      'Here is **bold** and a [link](https://example.com).\n- item with **bold** leader'
+    )
+    const ps = paragraphs(out)
+    expect(ps.length).toBeGreaterThan(0)
+    expect(ps.every((p) => p.textSyntax === 'MARKDOWN')).toBe(true)
+    const joined = ps.map((p) => p.text).join('\n')
+    expect(joined).toContain('Here is bold and a link (https://example.com).')
+    expect(joined).toContain('- item with **bold** leader')
+  })
+
+  test('keeps fenced code blocks intact', () => {
+    const out = markdownToChatMessage('Run this:\n```ts\nconst x = 1\n```')
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    expect(joined).toContain('const x = 1')
+  })
+
+  test('renders standalone Markdown images as image widgets', () => {
+    const out = markdownToChatMessage('Look:\n![a diagram](https://example.com/x.png)')
+    const widgets = (out.cardsV2 ?? [])
+      .flatMap((c) => c.card.sections ?? [])
+      .flatMap((s) => s.widgets ?? [])
+    const image = widgets.find((w) => w.image)?.image
+    expect(image?.imageUrl).toBe('https://example.com/x.png')
+    expect(image?.altText).toBe('a diagram')
+  })
+
+  test('keeps underscores in image URLs out of the italic rule', () => {
+    // flattenCardProseInline runs before the card splitter, and its `_italic_`
+    // rule used to eat paired underscores out of the URL. The line still parsed
+    // as an image afterwards, so the widget pointed at a 404 and the card
+    // rendered blank with no API error to log.
+    const out = markdownToChatMessage('![shot](https://example.com/screenshot_2026_08_19.png)')
+    const image = (out.cardsV2 ?? [])
+      .flatMap((c) => c.card.sections ?? [])
+      .flatMap((s) => s.widgets ?? [])
+      .find((w) => w.image)?.image
+    expect(image?.imageUrl).toBe('https://example.com/screenshot_2026_08_19.png')
+  })
+
+  test('maps headings to section headers', () => {
+    const out = markdownToChatMessage('# Title\nbody text')
+    const headers = (out.cardsV2 ?? []).flatMap((c) => c.card.sections ?? []).map((s) => s.header)
+    expect(headers).toContain('Title')
+  })
+
+  test('fences and column-aligns tables instead of leaking raw pipes', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |'
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    // Cells are padded to the column width; outer pipes are dropped.
+    expect(joined).toContain('name | age')
+    expect(joined).toContain('bob  | 30')
+    expect(joined).not.toContain('| name | age |')
+  })
+
+  test('aligns ragged unpadded tables and tables without outer pipes', () => {
+    const md = 'Metric | Value\n--- | ---\nLatency | 42ms\nErrors | 0'
+    const out = markdownToChatMessage(md)
+    // No outer pipes => not "rich" by the delivery heuristic, so the plain `text`
+    // path must still carry an aligned, fenced table (never raw pipes).
+    expect(out.text).toContain('```')
+    expect(out.text).toContain('Metric  | Value')
+    expect(out.text).toContain('Latency | 42ms')
+    expect(out.text).not.toMatch(/\n[^`\n]*\|\s*\n/) // no unfenced pipe row leaks
+  })
+
+  test('wide / link-heavy tables become a responsive record list, not dash soup', () => {
+    const md = [
+      '| Live site | What it is | Repo |',
+      '| --- | --- | --- |',
+      '| [demo.example.com](https://demo.example.com/) | **"Example Demos"** — 7 interactive use-case demos: transfers, agentic reports, paywalls, recurring purchases | `example-org/demo-directory` |'
+    ].join('\n')
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    // No fence and no giant dash separator — it would wrap unreadably on a card.
+    expect(joined).not.toContain('```')
+    expect(joined).not.toMatch(/-{20}/)
+    // Row title + labelled bullets, with the link preserved (clickable, not raw).
+    expect(joined).toContain('**[demo.example.com](https://demo.example.com/)**')
+    expect(joined).toContain('- What it is: **"Example Demos"**')
+    expect(joined).toContain('- Repo: `example-org/demo-directory`')
+  })
+
+  test('compact plain tables still render as an aligned monospace fence', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |'
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    expect(joined).toContain('name | age')
+  })
+
+  test('table-first answers fence the table and keep the prose in the card body', () => {
+    const md = '| name | age |\n| --- | --- |\n| bob | 30 |\n\nSummary prose here.'
+    const out = markdownToChatMessage(md)
+    const joined = paragraphs(out)
+      .map((p) => p.text)
+      .join('\n')
+    expect(joined).toContain('```')
+    expect(joined).toContain('Summary prose here')
+  })
+
+  test('plain text remains complete for exact byte-aware splitting by the renderer', () => {
+    const long = 'x'.repeat(10_000)
+    const out = markdownToChatMessage(long)
+    expect(out.text).toBe(long)
+  })
+
+  test('stripInlineMarkdown removes markup card headers cannot render', () => {
+    expect(stripInlineMarkdown('**Q2** results')).toBe('Q2 results')
+    expect(stripInlineMarkdown('[Docs](https://x/y) and `code`')).toBe('Docs and code')
+    expect(stripInlineMarkdown('~~old~~ _new_')).toBe('old new')
+    const invalid = '[\\'.repeat(10_000)
+    expect(stripInlineMarkdown(invalid)).toBe(invalid)
+    const adversarial = '__' + '**a'.repeat(10_000)
+    expect(stripInlineMarkdown(adversarial).length).toBeLessThanOrEqual(adversarial.length)
+  })
+
+  test('card headings strip inline markdown from the section header title', () => {
+    const headers = (markdownToChatMessage('## **Q2** [report](https://x/y)').cardsV2 ?? [])
+      .flatMap((c) => c.card.sections ?? [])
+      .map((s) => s.header)
+      .filter(Boolean)
+    expect(headers).toContain('Q2 report')
+  })
+
+  test('normalizeCardBreaks turns a stray <br> into a real newline (outside fences)', () => {
+    expect(normalizeCardBreaks('**Head**<br>- item one\n- item two')).toBe(
+      '**Head**\n- item one\n- item two'
+    )
+    // inside a code fence, <br> is left literal
+    expect(normalizeCardBreaks('```\na<br>b\n```')).toBe('```\na<br>b\n```')
+  })
+
+  test('plain text path translates GFM the text field cannot render into Chat markup', () => {
+    const md = '**Barcelona ~29°C, sunny** — Sources: [Met Office](https://w.example/sp3) · [AccuWeather](https://a.example/bcn)'
+    const out = markdownToChatMessage(md)
+    // No leaked GFM: bold double-asterisks and `[label](url)` are gone.
+    expect(out.text).not.toContain('**')
+    expect(out.text).not.toContain('](http')
+    // Rendered as Chat-flavoured bold + `<url|label>` links.
+    expect(out.text).toContain('*Barcelona ~29°C, sunny*')
+    expect(out.text).toContain('<https://w.example/sp3|Met Office>')
+    expect(out.text).toContain('<https://a.example/bcn|AccuWeather>')
+  })
+
+  test('toChatTextMarkup leaves image embeds and plain prose untouched', () => {
+    expect(toChatTextMarkup('plain prose, no markup')).toBe('plain prose, no markup')
+    expect(toChatTextMarkup('![alt](https://img.example/x.png)')).toBe('![alt](https://img.example/x.png)')
+  })
+
+  test('toChatTextMarkup converts headings to bold lines and GFM italics to Chat italics', () => {
+    // `#` has no Chat-markup analog; a bold line is the closest. Inner markers
+    // are stripped so `## **X**` nests to `*X*`, not `***X***`.
+    expect(toChatTextMarkup('## Weekly **summary**\nbody')).toBe('*Weekly summary*\nbody')
+    // GFM `*italic*` must become `_italic_` — a single `*` is BOLD in Chat markup.
+    expect(toChatTextMarkup('High on *what* only')).toBe('High on _what_ only')
+    // Italic conversion must not eat bold runs on the same line.
+    expect(toChatTextMarkup('a *i* and **b** mix')).toBe('a _i_ and *b* mix')
+  })
+
+  test('toChatTextMarkup is fence-aware: code blocks pass through untouched', () => {
+    const md = 'above **bold**\n```py\n# not a heading\nx = 2 ** 3\n```\n# Real heading'
+    expect(toChatTextMarkup(md)).toBe('above *bold*\n```py\n# not a heading\nx = 2 ** 3\n```\n*Real heading*')
+  })
+
+  test('flattenCardProseInline strips prose spans, keeps list items and fences', () => {
+    // Prose: every inline span would fragment onto its own line in a card.
+    expect(flattenCardProseInline("Farao's **launch**, not *drift* — see `source` and [docs](https://x/y)")).toBe(
+      "Farao's launch, not drift — see source and docs (https://x/y)"
+    )
+    // List items render inline spans correctly in cards — keep their markdown.
+    expect(flattenCardProseInline('- **Installs spiked** (vs baseline)')).toBe(
+      '- **Installs spiked** (vs baseline)'
+    )
+    // Whole-line bold (pseudo headings, record-list row titles) already owns its
+    // line, so the bold is kept; heading lines are left for header extraction.
+    expect(flattenCardProseInline('**Product & SDK**')).toBe('**Product & SDK**')
+    expect(flattenCardProseInline('**[demo](https://demo.example/)**')).toBe('**[demo](https://demo.example/)**')
+    expect(flattenCardProseInline('## **Q2** [report](https://x/y)')).toBe('## **Q2** [report](https://x/y)')
+    // Fences are never touched.
+    expect(flattenCardProseInline('```\n**not stripped**\n```')).toBe('```\n**not stripped**\n```')
+  })
+
+  test('normalizeCardBreaks collapses mashing blank lines but keeps lists and gaps after lists', () => {
+    // Blank line between two TEXT lines (which a card collapses → mash) becomes a
+    // single `\n` break; a blank line AFTER a list item is kept (safe + a gap).
+    expect(
+      normalizeCardBreaks('releases.\n\n**Product & SDK**\n- api\n- dash\n\n**Farao**\n- tg')
+    ).toBe('releases.\n**Product & SDK**\n- api\n- dash\n\n**Farao**\n- tg')
+    // Standalone horizontal rules are dropped (cards cannot render them).
+    expect(normalizeCardBreaks('pad it.\n\n---\n\n**Pulse**')).toBe('pad it.\n**Pulse**')
+    // Fenced blocks (aligned tables) are left exactly as-is.
+    expect(normalizeCardBreaks('```\nname | age\nbob  | 30\n```')).toBe('```\nname | age\nbob  | 30\n```')
+  })
+
+  test('real digest markdown no longer mashes heading into surrounding prose', () => {
+    const md = 'rather than pad it.\n\n---\n\n**🦅 Daily Pulse — Tuesday, 30 Jun 2026**\n\nQuiet day; no new package releases.\n\n**Product & SDK**\n- `api` · foo · [#1077](https://x/1)\n- `dash` · bar · [#195](https://x/2)\n\n**Farao (app)**\n- New Telegram'
+    const joined = paragraphs(markdownToChatMessage(md))
+      .map((p) => p.text)
+      .join('\n')
+    // No mashing: the title and "Product & SDK" sit on their own lines (single \n),
+    // the `---` rule is gone, and "Farao" keeps its blank-line gap after the list.
+    expect(joined).toContain('pad it.\n**🦅 Daily Pulse — Tuesday, 30 Jun 2026**\nQuiet day')
+    expect(joined).toContain('no new package releases.\n**Product & SDK**\n- `api`')
+    expect(joined).toContain('[#195](https://x/2)\n\n**Farao (app)**\n- New Telegram')
+    expect(joined).not.toContain('---')
+  })
+
+  test('splits into multiple cards before exceeding the per-card widget limit', () => {
+    // Many headings => many sections/widgets; must roll into >1 card.
+    const md = Array.from({ length: 200 }, (_, i) => `# H${i}\nline ${i}`).join('\n')
+    const out = markdownToChatMessage(md)
+    for (const entry of out.cardsV2 ?? []) {
+      const widgets = (entry.card.sections ?? []).reduce(
+        (n, s) => n + (s.widgets?.length ?? 0),
+        0
+      )
+      expect(widgets).toBeLessThanOrEqual(chatReplyLimits.card.maxWidgetsPerCard)
+      expect(messageUtf8Bytes({ fallbackText: CARD_FALLBACK_TEXT, cardsV2: [entry] }))
+        .toBeLessThanOrEqual(chatReplyLimits.message.maxBytes)
+    }
+  })
+
+  test('never emits an empty card section for terminal or consecutive headings', () => {
+    const out = markdownToChatMessage('# One\n## Two\nbody\n### Three')
+    const sections = (out.cardsV2 ?? []).flatMap(card => card.card.sections ?? [])
+    expect(sections.length).toBeGreaterThan(0)
+    expect(sections.every(section => (section.widgets?.length ?? 0) >= 1)).toBe(true)
+    expect(sections.map(section => section.header)).toContain('Three')
+  })
+
+  test('splits text by UTF-8 bytes without cutting or losing emoji and CJK', () => {
+    const source = '😀漢字abc'.repeat(2_000)
+    const chunks = splitUtf8Text(source, 31_999)
+    expect(chunks.join('')).toBe(source)
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= 31_999)).toBe(true)
+  })
+})
+
+describe('fenceMarkdownTables', () => {
+  test('does not double-fence tables already inside a code block', () => {
+    const md = '```\n| a | b |\n| --- | --- |\n```'
+    expect(fenceMarkdownTables(md)).toBe(md)
+  })
+})

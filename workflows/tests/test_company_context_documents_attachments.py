@@ -208,6 +208,105 @@ def test_coordinator_starts_one_child_per_enabled_scope(monkeypatch):
     assert ctx.logs[-1][0] == "company_context_documents_coordinator_completed"
 
 
+def test_coordinator_claims_google_chat_thread_scope_when_enabled(monkeypatch):
+    last_watermark = dt.datetime(2026, 6, 18, 22, 59, 36, tzinfo=dt.UTC)
+    claimed_scopes: list[str] = []
+
+    async def latest_watermark(_pool, _run_id):
+        return last_watermark
+
+    async def claim_scope(_pool, *, scope, **_kwargs):
+        claimed_scopes.append(scope)
+        return {
+            "scope": scope,
+            "lease_token": f"lease_{scope}",
+            "window_end": dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC),
+        }
+
+    async def noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("SLACK_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_DRIVE_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_CALENDAR_ETL_ENABLED", "false")
+    monkeypatch.setenv("GOOGLE_CHAT_ETL_ENABLED", "true")
+    monkeypatch.setenv("LINEAR_ETL_ENABLED", "false")
+    monkeypatch.setenv("COMPANY_CONTEXT_DOCUMENTS_ENABLED", "true")
+    monkeypatch.setattr(projection, "_latest_successful_watermark", latest_watermark)
+    monkeypatch.setattr(projection, "_claim_scope", claim_scope)
+    monkeypatch.setattr(projection, "_emit_projection_lag_from_checkpoints", noop_async)
+    monkeypatch.setattr(projection, "_emit_etl_scope_metrics", noop_async)
+
+    ctx = FakeWorkflowContext()
+    result = asyncio.run(
+        projection.handler(
+            projection.Input(max_window_seconds=3600),
+            ctx,
+        )
+    )
+
+    assert claimed_scopes == ["google_chat_thread", "google_chat_attachment"]
+    assert [child[1]["scope"] for child in ctx.children] == [
+        "google_chat_thread",
+        "google_chat_attachment",
+    ]
+    assert result["started_scopes"]
+
+
+class FakeGoogleChatThreadPool:
+    """Fake pool for _project_scope_page's google_chat_thread branch: serves
+    thread messages via fetch() and records upserts via fetchval()/execute()
+    without a real content-hash match, so every document inserts."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.messages = messages
+        self.executed: list[tuple[str, tuple]] = []
+
+    async def fetch(self, _query, *_args):
+        return self.messages
+
+    async def fetchval(self, _query, *_args):
+        return None
+
+    async def execute(self, query, *args):
+        self.executed.append((query, args))
+        return "UPDATE 1" if "DELETE" in query else "INSERT 0 1"
+
+
+def test_project_scope_page_dispatches_google_chat_thread():
+    updated_at = dt.datetime(2026, 7, 18, 12, 0, 0, tzinfo=dt.UTC)
+    create_time = dt.datetime(2026, 7, 18, 11, 59, 0, tzinfo=dt.UTC)
+    message_row = {
+        "space_id": "AAAA",
+        "thread_id": "BBBB",
+        "message_id": "CCCC",
+    }
+    thread_message = {
+        "space_id": "AAAA",
+        "space_display_name": "Engineering",
+        "space_type": "SPACE",
+        "message_id": "CCCC",
+        "message_name": "spaces/AAAA/messages/CCCC",
+        "thread_id": "BBBB",
+        "sender_id": "users/1",
+        "sender_name": "Ada Lovelace",
+        "sender_type": "HUMAN",
+        "text_content": "Ship it.",
+        "source_create_time": create_time,
+        "updated_at": updated_at,
+    }
+    pool = FakeGoogleChatThreadPool([thread_message])
+
+    upserted, deleted = asyncio.run(
+        projection._project_scope_page(pool, "google_chat_thread", [message_row])
+    )
+
+    assert (upserted, deleted) == (1, 0)
+    insert_calls = [call for call in pool.executed if "INSERT INTO" in call[0]]
+    assert len(insert_calls) == 1
+    assert insert_calls[0][1][0] == "google_chat:thread:AAAA:BBBB"
+
+
 def test_scope_batch_advances_cursor_before_starting_one_continuation(monkeypatch):
     window_end = dt.datetime(2026, 6, 18, 23, 58, 36, tzinfo=dt.UTC)
     cursor_at = dt.datetime(2026, 6, 18, 23, 0, tzinfo=dt.UTC)

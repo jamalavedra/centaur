@@ -1,0 +1,264 @@
+{{- if .Values.googlechatbot.enabled }}
+{{- if and .Values.googlechatbot.requireSignedRequests (eq .Values.googlechatbot.ingressMode "chat_api_project") (not .Values.googlechatbot.projectNumber) }}
+{{- fail "googlechatbot chat_api_project ingress requires googlechatbot.projectNumber when signed requests are enabled" }}
+{{- end }}
+{{- if and .Values.googlechatbot.requireSignedRequests (or (eq .Values.googlechatbot.ingressMode "chat_api_url") (eq .Values.googlechatbot.ingressMode "workspace_addon")) (not .Values.googlechatbot.webhookAudience) }}
+{{- fail "googlechatbot URL-based ingress requires googlechatbot.webhookAudience when signed requests are enabled" }}
+{{- end }}
+{{- if and .Values.googlechatbot.requireSignedRequests (eq .Values.googlechatbot.ingressMode "workspace_addon") (not .Values.googlechatbot.addonServiceAccountEmail) }}
+{{- fail "googlechatbot workspace_addon ingress requires googlechatbot.addonServiceAccountEmail when signed requests are enabled" }}
+{{- end }}
+{{- range $name := tuple "GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS" "GOOGLECHATBOT_INGRESS_MODE" "GOOGLECHATBOT_PROJECT_NUMBER" "GOOGLECHATBOT_WEBHOOK_AUDIENCE" "GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL" "GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID" "GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS" }}
+{{- if hasKey $.Values.googlechatbot.extraEnv $name }}
+{{- fail (printf "configure %s through the first-class googlechatbot ingress-auth values, not googlechatbot.extraEnv" $name) }}
+{{- end }}
+{{- end }}
+{{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $googleChatBotMetricsAnnotations := dict -}}
+{{- if .Values.googlechatbot.metrics.scrapeAnnotations -}}
+{{- $googleChatBotMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.googlechatbot.metrics.path "prometheus.io/port" "3002" -}}
+{{- $googleChatBotMetricsAnnotations = mergeOverwrite $googleChatBotMetricsAnnotations (.Values.googlechatbot.metrics.annotations | default dict) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+spec:
+  replicas: {{ .Values.googlechatbot.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- with $googleChatBotMetricsAnnotations }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 8 }}
+        centaur.ai/metrics: googlechatbot
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: googlechatbot
+          image: {{ printf "%s:%s" .Values.googlechatbot.image.repository .Values.googlechatbot.image.tag | quote }}
+          imagePullPolicy: {{ .Values.googlechatbot.image.pullPolicy }}
+          env:
+            - name: PORT
+              value: "3002"
+            - name: CENTAUR_API_URL
+              value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            # Default harness for new threads (per-session --claude/--codex flags
+            # still override). Mirrors the other bots: driven by sandbox.harnessEngine.
+            - name: GOOGLECHATBOT_DEFAULT_HARNESS
+              value: {{ .Values.sandbox.harnessEngine | quote }}
+            - name: GOOGLECHATBOT_CODEX_NANOCODEX_ROLLOUT_PERCENT
+              value: {{ .Values.googlechatbot.codexNanocodexRolloutPercent | quote }}
+            - name: GOOGLECHATBOT_THREAD_HISTORY_LIMIT
+              value: {{ .Values.googlechatbot.threadHistoryLimit | quote }}
+            - name: GOOGLECHATBOT_ATTACHMENT_AGGREGATE_MAX_BYTES
+              value: {{ .Values.googlechatbot.attachmentAggregateMaxBytes | quote }}
+            # Service account key for the Chat REST client (JWT OAuth2) and bot identity.
+            - name: GOOGLE_SERVICE_ACCOUNT_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLE_SERVICE_ACCOUNT_JSON" .Values.secretManager.envPrefix }}
+            # api-rs ingress bearer token. Required, like slackbotv2's: api-rs
+            # authenticates every /api route, so an unset key means 401 on
+            # every session call rather than a working unauthenticated bot.
+            - name: GOOGLECHATBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLECHATBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: GOOGLECHATBOT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: GOOGLECHATBOT_STATE_KEY_PREFIX
+              value: {{ .Values.googlechatbot.stateKeyPrefix | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_MAX
+              value: {{ .Values.googlechatbot.statePool.max | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_IDLE_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.statePool.idleTimeoutMs | quote }}
+            - name: GOOGLECHATBOT_STATE_POOL_CONNECT_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.statePool.connectTimeoutMs | quote }}
+            - name: GOOGLECHATBOT_STATE_CONNECT_INITIAL_DELAY_MS
+              value: {{ .Values.googlechatbot.stateConnect.initialDelayMs | quote }}
+            - name: GOOGLECHATBOT_STATE_CONNECT_MAX_DELAY_MS
+              value: {{ .Values.googlechatbot.stateConnect.maxDelayMs | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_MAX_OBLIGATION_AGE_MS
+              value: {{ .Values.googlechatbot.recovery.maxObligationAgeMs | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_FAILURE_BUDGET
+              value: {{ .Values.googlechatbot.recovery.failureBudget | quote }}
+            - name: GOOGLECHATBOT_RECOVERY_SWEEP_INTERVAL_MS
+              value: {{ .Values.googlechatbot.recovery.sweepIntervalMs | quote }}
+            # Private api-rs -> googlechatbot credential. Never forwarded to a
+            # workflow or sandbox; NetworkPolicy admits api-rs only.
+            - name: GOOGLECHATBOT_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sGOOGLECHATBOT_INTERNAL_API_KEY" .Values.secretManager.envPrefix }}
+            - name: CHAT_EVENTS_PATH
+              value: {{ .Values.googlechatbot.eventsPath | quote }}
+            - name: GOOGLECHATBOT_REQUIRE_SIGNED_REQUESTS
+              value: {{ .Values.googlechatbot.requireSignedRequests | quote }}
+            - name: GOOGLECHATBOT_INGRESS_MODE
+              value: {{ .Values.googlechatbot.ingressMode | quote }}
+            - name: GOOGLECHATBOT_SIGNED_REQUEST_MAX_AGE_SECONDS
+              value: {{ .Values.googlechatbot.signedRequestMaxAgeSeconds | quote }}
+{{- if .Values.googlechatbot.projectNumber }}
+            - name: GOOGLECHATBOT_PROJECT_NUMBER
+              value: {{ .Values.googlechatbot.projectNumber | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.webhookAudience }}
+            - name: GOOGLECHATBOT_WEBHOOK_AUDIENCE
+              value: {{ .Values.googlechatbot.webhookAudience | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.addonServiceAccountEmail }}
+            - name: GOOGLECHATBOT_ADDON_SERVICE_ACCOUNT_EMAIL
+              value: {{ .Values.googlechatbot.addonServiceAccountEmail | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.addonOauthClientId }}
+            - name: GOOGLECHATBOT_ADDON_OAUTH_CLIENT_ID
+              value: {{ .Values.googlechatbot.addonOauthClientId | quote }}
+{{- end }}
+            - name: GOOGLECHATBOT_ALLOWED_DOMAIN
+              value: {{ .Values.googlechatbot.allowedDomain | quote }}
+{{- if .Values.googlechatbot.uploadUser }}
+            - name: GOOGLECHATBOT_UPLOAD_USER
+              value: {{ .Values.googlechatbot.uploadUser | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.reactionReadUser }}
+            - name: GOOGLECHATBOT_REACTION_READ_USER
+              value: {{ .Values.googlechatbot.reactionReadUser | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.driveDownloadUser }}
+            - name: GOOGLECHATBOT_DRIVE_DOWNLOAD_USER
+              value: {{ .Values.googlechatbot.driveDownloadUser | quote }}
+{{- end }}
+{{- if .Values.googlechatbot.spaceDefaults }}
+            # Per-space default harness / model / provider / reasoning, keyed by
+            # Google Chat space id. Applied below an explicit per-thread flag and
+            # above the deployment/baked default, and forwarded onto the harness
+            # input line so it takes effect. Mirrors slackbotv2's channelDefaults.
+            - name: GOOGLECHATBOT_SPACE_DEFAULTS
+              value: {{ .Values.googlechatbot.spaceDefaults | toJson | quote }}
+{{- end }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.mode | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MODEL
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.model | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.openaiBaseUrl | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_TIMEOUT_MS
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.timeoutMs | quote }}
+            - name: GOOGLECHATBOT_MESSAGE_OVERRIDES_MAX_OUTPUT_TOKENS
+              value: {{ .Values.googlechatbot.messageOverridesStrategy.maxOutputTokens | quote }}
+            - name: GOOGLECHATBOT_RESPONSE_METADATA_MODE
+              value: {{ .Values.googlechatbot.responseMetadataMode | quote }}
+            - name: GOOGLECHATBOT_RESPONSE_SERVICE_TIER_ENABLED
+              value: {{ .Values.googlechatbot.responseServiceTierEnabled | quote }}
+            # Shared with slackbotv2: same OPENAI_API_KEY secret key, optional so
+            # a deployment without it still starts (llm mode then no-ops).
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sOPENAI_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
+{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" "CENTAUR_PI_MODEL" }}
+{{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.googlechatbot.extraEnv $name)) }}
+            # Mirror the deployer's harness default-model override
+            # (sandbox.extraEnv) so the Chat Console-link line names the model
+            # sandboxes actually run. googlechatbot.extraEnv wins if it sets the
+            # same variable.
+            - name: {{ $name }}
+              value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
+{{- end }}
+{{- end }}
+{{- range $name, $value := .Values.googlechatbot.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+          ports:
+            - containerPort: 3002
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3002
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3002
+            timeoutSeconds: 5
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.googlechatbot.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3002
+      targetPort: 3002
+{{- if .Values.googlechatbot.ingress.enabled }}
+---
+# Dedicated public ingress for the Google Chat webhook. Separate from the
+# slackbotv2 ingress (which owns "/") so Google Chat can POST to its own host.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "googlechatbot") | nindent 4 }}
+  {{- with .Values.googlechatbot.ingress.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.googlechatbot.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - {{- if .Values.googlechatbot.ingress.host }}
+      host: {{ .Values.googlechatbot.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.googlechatbot.eventsPath | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "googlechatbot") }}
+                port:
+                  number: 3002
+  {{- with .Values.googlechatbot.ingress.tls }}
+  tls:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

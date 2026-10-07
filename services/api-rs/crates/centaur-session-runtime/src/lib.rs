@@ -1751,6 +1751,18 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionRuntimeError> {
+        self.append_messages_with_forwarding(thread_key, messages, true)
+            .await
+    }
+
+    /// Persist transcript messages, optionally steering an active execution.
+    /// Callers that already supplied these messages to execute must pass false.
+    pub async fn append_messages_with_forwarding(
+        &self,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+        forward_to_active_execution: bool,
+    ) -> Result<Vec<String>, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1809,8 +1821,10 @@ impl SessionRuntime {
                 return Err(error);
             }
         };
-        self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
-            .await;
+        if forward_to_active_execution {
+            self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
+                .await;
+        }
         self.spawn_session_title_generation(thread_key);
         Ok(message_ids)
     }
@@ -3231,9 +3245,11 @@ impl SessionRuntime {
     }
 
     /// Resolve and upsert the principal of the human requesting this turn from
-    /// the execute metadata. `None` for DM and non-Slack threads (the
-    /// registrar decides) and on registrar failure: a broken requester lookup
-    /// must degrade to today's requester-less turn, never fail the execution.
+    /// the execute metadata. `None` when the ingress named no eligible
+    /// requester (the registrar decides: Slack DMs, unverified Google Chat
+    /// senders, other thread families) and on registrar failure: a broken
+    /// requester lookup must degrade to today's requester-less turn, never
+    /// fail the execution.
     async fn resolve_requester_principal(
         &self,
         thread_key: &ThreadKey,
@@ -6725,7 +6741,7 @@ fn merge_session_context(
 }
 
 /// Build the structured per-turn session context for a thread, mirroring the
-/// `/api/session` response shape (`{ platform, <slack|discord|linear|github>: { .. } }`).
+/// `/api/session` response shape (`{ platform, <slack|discord|linear|github|google_chat>: { .. } }`).
 ///
 /// Resolved from the same [`ChatDestination`] the session-context route uses, so
 /// the structured context the agent sees in its input is consistent with what
@@ -6798,6 +6814,15 @@ fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<
                 );
             }
             ("github", github)
+        }
+        ChatDestination::GoogleChat {
+            space_name,
+            thread_name,
+        } => {
+            let mut google_chat = serde_json::Map::new();
+            google_chat.insert("space_name".to_owned(), Value::String(space_name));
+            google_chat.insert("thread_name".to_owned(), Value::String(thread_name));
+            ("google_chat", google_chat)
         }
     };
     context.insert(platform_key.to_owned(), Value::Object(block));
@@ -8793,6 +8818,26 @@ mod tests {
     }
 
     #[test]
+    fn input_line_with_session_context_adds_google_chat_thread_context() {
+        let thread_key = ThreadKey::parse("chat:spaces:AAAA:spaces:AAAA:threads:BBBB").unwrap();
+        let trace = SessionTraceContext::new(None, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "google_chat");
+        assert_eq!(
+            value["session_context"]["google_chat"]["space_name"],
+            "spaces/AAAA"
+        );
+        assert_eq!(
+            value["session_context"]["google_chat"]["thread_name"],
+            "spaces/AAAA/threads/BBBB"
+        );
+        assert!(value["session_context"].get("slack").is_none());
+    }
+
+    #[test]
     fn input_line_with_session_context_preserves_existing_session_context() {
         let thread_key = ThreadKey::parse("slack:T123:C123:1780000000.000000").unwrap();
         let trace = SessionTraceContext::new(None, None);
@@ -9156,6 +9201,73 @@ mod adoption_tests {
             labels: BTreeMap::new(),
             sandbox_observability_enabled: true,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_append_persists_without_replaying_but_new_messages_still_steer() {
+        use tokio::io::AsyncReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:transcript-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-transcript"), true).await;
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, mut stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-transcript")
+            .await
+            .unwrap();
+        let message = SessionMessageInput {
+            client_message_id: Some("already-executed".to_owned()),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": "already executed"})],
+            metadata: json!({}),
+        };
+        let ids = runtime
+            .append_messages_with_forwarding(&thread_key, &[message], false)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from session_messages where thread_key = $1")
+                .bind(thread_key.as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "transcript must still be durable");
+        let mut buffer = [0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stdin.read(&mut buffer))
+                .await
+                .is_err(),
+            "persist-only append must not write another harness input"
+        );
+        runtime
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("new-message".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "a real follow-up"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(2), stdin.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let input: Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert!(input.to_string().contains("a real follow-up"));
+        assert!(!input.to_string().contains("already executed"));
+        store.complete_execution(&execution_id).await.unwrap();
     }
 
     #[tokio::test]

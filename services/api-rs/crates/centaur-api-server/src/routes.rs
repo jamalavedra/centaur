@@ -48,15 +48,16 @@ use crate::{
     ApiError,
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
+    google_chat_proxy::google_chat_proxy_router,
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
-        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        ExecuteSessionResponse, GithubThreadContext, GoogleChatThreadContext,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
+        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -228,6 +229,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(pause_session_sandbox),
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .merge(google_chat_proxy_router())
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -497,6 +499,10 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
             capability(Capability::WorkflowsActions)
         }
         (_, route) if route.starts_with("/api/slack/") => Some(RouteAccess::PrincipalOnly),
+        // Google Chat proxy routes mirror the Slack proxy: the handler re-checks
+        // the console JWT's exact space/DM grants, so the middleware only has to
+        // establish that the caller is a principal.
+        (_, route) if route.starts_with("/api/google-chat/") => Some(RouteAccess::PrincipalOnly),
         (_, route) if route.starts_with("/api/admin/slack/dm-sync/") => {
             capability(Capability::AdminSync)
         }
@@ -599,7 +605,7 @@ async fn get_session_context(
         .map(ChatDestination::platform)
         .unwrap_or("unknown")
         .to_owned();
-    let (slack, discord, linear, github) = match destination {
+    let (slack, discord, linear, github, google_chat) = match destination {
         Some(ChatDestination::Slack {
             channel_id,
             thread_ts,
@@ -608,6 +614,7 @@ async fn get_session_context(
                 channel_id,
                 thread_ts,
             }),
+            None,
             None,
             None,
             None,
@@ -625,6 +632,7 @@ async fn get_session_context(
             }),
             None,
             None,
+            None,
         ),
         Some(ChatDestination::Linear {
             issue_id,
@@ -638,6 +646,7 @@ async fn get_session_context(
                 comment_id,
                 agent_session_id,
             }),
+            None,
             None,
         ),
         Some(ChatDestination::Github {
@@ -657,8 +666,22 @@ async fn get_session_context(
                 kind: kind.as_str().to_owned(),
                 review_comment_id,
             }),
+            None,
         ),
-        None => (None, None, None, None),
+        Some(ChatDestination::GoogleChat {
+            space_name,
+            thread_name,
+        }) => (
+            None,
+            None,
+            None,
+            None,
+            Some(GoogleChatThreadContext {
+                space_name,
+                thread_name,
+            }),
+        ),
+        None => (None, None, None, None, None),
     };
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
@@ -679,6 +702,7 @@ async fn get_session_context(
         discord,
         linear,
         github,
+        google_chat,
     }))
 }
 
@@ -690,7 +714,11 @@ async fn append_messages(
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let message_ids = state
         .runtime()?
-        .append_messages(&thread_key, &request.messages)
+        .append_messages_with_forwarding(
+            &thread_key,
+            &request.messages,
+            request.forward_to_active_execution.unwrap_or(true),
+        )
         .await?;
     Ok(Json(AppendMessagesResponse {
         ok: true,
@@ -728,17 +756,23 @@ async fn execute_session(
 }
 
 /// `requester_principal_foreign_id` is an identity assertion made by the
-/// authenticated Console service, not ordinary caller-controlled metadata.
-/// Strip it from every other caller class before the execution is persisted so
-/// the runtime can safely honor Console requesters on any thread namespace.
+/// authenticated Console service, and the `googlechat_*` requester keys are
+/// one made by the Google Chat ingress from its signed request; neither is
+/// ordinary caller-controlled metadata. Strip each from every other caller
+/// class before the execution is persisted so the runtime can safely honor
+/// them on any thread namespace.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
     mut metadata: Option<Value>,
 ) -> Option<Value> {
-    if caller_class != CallerClass::Console
-        && let Some(Value::Object(fields)) = metadata.as_mut()
-    {
-        fields.remove("requester_principal_foreign_id");
+    if let Some(Value::Object(fields)) = metadata.as_mut() {
+        if caller_class != CallerClass::Console {
+            fields.remove("requester_principal_foreign_id");
+        }
+        if caller_class != CallerClass::Ingress {
+            fields.remove("googlechat_request_verified");
+            fields.remove("googlechat_requester_email");
+        }
     }
     metadata
 }
@@ -882,6 +916,56 @@ mod session_authorization_tests {
             Some("prn_owner")
         ));
         assert!(!principal_subject_owns_session(Some("prn_owner"), None));
+    }
+
+    #[test]
+    fn chat_proxy_routes_authorize_as_principal_only() {
+        use axum::http::Method;
+
+        use super::{RouteAccess, route_access};
+
+        // A route with no policy is denied outright, so a missing Google Chat
+        // arm would take the whole Chat proxy offline rather than fail open.
+        // Kept alongside the Slack cases so the two stay in step.
+        for (method, route) in [
+            (Method::GET, "/api/slack/conversations"),
+            (Method::GET, "/api/google-chat/spaces"),
+            (Method::POST, "/api/google-chat/spaces/{space_id}/messages"),
+            (Method::POST, "/api/google-chat/dms/setup"),
+        ] {
+            assert!(
+                matches!(
+                    route_access(&method, route),
+                    Some(RouteAccess::PrincipalOnly)
+                ),
+                "{method} {route} must authorize as a principal"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ingress_callers_may_assert_a_google_chat_requester() {
+        let metadata = json!({
+            "source": "googlechatbot",
+            "googlechat_request_verified": true,
+            "googlechat_requester_email": "ada@example.com"
+        });
+
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Ingress, Some(metadata.clone())),
+            Some(metadata.clone())
+        );
+        for caller_class in [
+            CallerClass::Admin,
+            CallerClass::Console,
+            CallerClass::Principal,
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, Some(metadata.clone())),
+                Some(json!({ "source": "googlechatbot" })),
+                "{caller_class:?}"
+            );
+        }
     }
 
     #[test]

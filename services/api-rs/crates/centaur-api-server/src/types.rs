@@ -44,7 +44,8 @@ pub struct CreateSessionResponse {
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
     /// The chat surface the agent is operating on: `slack`, `discord`, `linear`,
-    /// `github`, or `unknown` for threads that are not platform-addressable.
+    /// `github`, `google_chat`, or `unknown` for threads that are not
+    /// platform-addressable.
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -56,6 +57,8 @@ pub struct SessionContextResponse {
     pub linear: Option<LinearThreadContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubThreadContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_chat: Option<GoogleChatThreadContext>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -92,9 +95,19 @@ pub struct GithubThreadContext {
     pub review_comment_id: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct GoogleChatThreadContext {
+    pub space_name: String,
+    pub thread_name: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppendMessagesRequest {
     pub messages: Vec<SessionMessageInput>,
+    /// False records transcript context without sending another harness input.
+    /// Omitted retains the existing active-turn steering behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_to_active_execution: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

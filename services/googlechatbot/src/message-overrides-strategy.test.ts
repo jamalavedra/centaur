@@ -1,0 +1,286 @@
+import { test, expect, describe, mock } from 'bun:test'
+import { loadConfig } from './config'
+import {
+  createFlagMessageOverridesStrategy,
+  createOpenAiMessageOverridesStrategy,
+  messageOverridesStrategyFromConfig
+} from './message-overrides-strategy'
+
+describe('createFlagMessageOverridesStrategy', () => {
+  test('parses literal flags, matching extractMessageOverrides', async () => {
+    const strategy = createFlagMessageOverridesStrategy()
+    const out = await strategy('fix the bug --model gpt-5.2')
+    expect(out.model).toBe('gpt-5.2')
+    expect(out.cleanedText).toBe('fix the bug')
+  })
+})
+
+function fakeResponsesApi(outputText: string, ok = true) {
+  return mock(async () =>
+    new Response(
+      JSON.stringify({ output: [{ content: [{ text: outputText }] }] }),
+      { status: ok ? 200 : 500 }
+    )
+  )
+}
+
+describe('createOpenAiMessageOverridesStrategy', () => {
+  test('applies a validated LLM override and leaves the text unchanged', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: 'gpt-6-sol', provider: null, reasoning: 'max' })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use max effort and the sol model')
+
+    expect(out.model).toBe('gpt-6-sol')
+    expect(out.harnessType).toBe('codex')
+    expect(out.reasoning).toBe('max')
+    expect(out.cleanedText).toBe('use max effort and the sol model')
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  test('selects Sol and Luna while preserving explicit older generations', async () => {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-luna']) {
+      let request: any
+      const strategy = createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        model: 'gpt-5.4-nano',
+        fetch: (async (_url, init) => {
+          request = JSON.parse(init!.body as string)
+          return Response.json({
+            output: [{ content: [{ text: JSON.stringify({
+              harness: null, model, provider: null, reasoning: 'max'
+            }) }] }]
+          })
+        }) as typeof fetch
+      })
+      expect(await strategy(`use ${model}`)).toMatchObject({
+        model, harnessType: 'codex', reasoning: 'max'
+      })
+      expect(request.instructions).toContain('sol -> gpt-6-sol')
+      expect(request.instructions).toContain('luna -> gpt-6-luna')
+      expect(request.instructions).toContain('opus -> claude-opus-5-5')
+      expect(request.instructions).toContain('opus 5 -> claude-opus-5,')
+      expect(request.text.format.schema.properties.model.enum).toContain(model)
+      expect(request.text.format.schema.properties.model.enum).toContain('claude-opus-5-5')
+    }
+  })
+
+  test('selects claude-opus-4-7 and implies the claudecode harness', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: 'claude-opus-4-7', provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use claude opus 4.7')
+
+    expect(out.model).toBe('claude-opus-4-7')
+    expect(out.harnessType).toBe('claudecode')
+  })
+
+  // Upstream #1177 parity: the Opus 5 pair has to survive schema validation and
+  // imply claudecode, otherwise the selection is discarded and the turn silently
+  // falls back to the default harness.
+  test('selects the Opus 5 models and implies the claudecode harness', async () => {
+    for (const model of ['claude-opus-5', 'claude-opus-5-fast', 'claude-opus-5-5']) {
+      const fetchFn = fakeResponsesApi(
+        JSON.stringify({ harness: null, model, provider: null, reasoning: null })
+      )
+      const strategy = createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key',
+        fetch: fetchFn as unknown as typeof fetch,
+        model: 'gpt-5.4-nano'
+      })
+
+      const out = await strategy(`use ${model}`)
+
+      expect(out.model).toBe(model)
+      expect(out.harnessType).toBe('claudecode')
+    }
+  })
+
+  test('strips one or many trailing slashes from a configured base URL', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1///',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    await strategy('use the codex model to deploy the thing')
+
+    const [calledUrl] = fetchFn.mock.calls[0] as unknown as [string, unknown]
+    expect(calledUrl).toBe('https://example.test/v1/responses')
+  })
+
+  test('drops the whole bundle when the model output fails validation', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'not-a-harness', model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('some message')
+
+    expect(out.harnessType).toBeUndefined()
+    expect(out.model).toBeUndefined()
+  })
+
+  test('fails open (no overrides) when the API call errors', async () => {
+    const fetchFn = mock(async () => new Response('boom', { status: 500 }))
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('some message')
+
+    expect(out).toEqual({ cleanedText: 'some message' })
+  })
+
+  test('handles --nanocodex deterministically before the OpenAI strategy', async () => {
+    const fetchFn = mock(async () => {
+      throw new Error('the explicit flag must not call the strategy model')
+    })
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('--nanocodex review this')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.cleanedText).toBe('review this')
+    expect(fetchFn).toHaveBeenCalledTimes(0)
+  })
+
+  test('allows the OpenAI strategy to select nanocodex from natural language', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'nanocodex', model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use nanocodex for this')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  test('allows the OpenAI strategy to select hermes from natural language', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'hermes', model: null, provider: null, reasoning: null })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use hermes for this')
+
+    expect(out.harnessType).toBe('hermes')
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  // Nanocodex consumes the same effort knob as Codex, so a nanocodex selection
+  // must keep its reasoning instead of silently falling back to the default.
+
+  test('keeps the reasoning effort when the strategy selects nanocodex', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: 'nanocodex', model: null, provider: null, reasoning: 'high' })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('use nanocodex with high effort')
+
+    expect(out.harnessType).toBe('nanocodex')
+    expect(out.reasoning).toBe('high')
+  })
+})
+
+describe('messageOverridesStrategyFromConfig', () => {
+  test('defaults to the flag strategy', async () => {
+    const config = loadConfig({})
+    const strategy = messageOverridesStrategyFromConfig(config)
+    const out = await strategy('go --claude')
+    expect(out.harnessType).toBe('claudecode')
+    expect(out.cleanedText).toBe('go')
+  })
+
+  test('falls back to a no-op strategy when llm mode has no API key', async () => {
+    const config = loadConfig({ GOOGLECHATBOT_MESSAGE_OVERRIDES_STRATEGY: 'llm' })
+    const strategy = messageOverridesStrategyFromConfig(config)
+    const out = await strategy('use max effort')
+    expect(out).toEqual({ cleanedText: 'use max effort' })
+  })
+
+})
+
+describe('persona flag with the OpenAI strategy', () => {
+  test('a lone --persona still lets the LLM read the rest of the message', async () => {
+    const fetchFn = fakeResponsesApi(
+      JSON.stringify({ harness: null, model: 'gpt-6-astra', provider: null, reasoning: 'ultra' })
+    )
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: fetchFn as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+
+    const out = await strategy('--persona eng use astra at ultra effort')
+
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, { body: string }]
+    expect((JSON.parse(init.body) as { input: string }).input).toBe('use astra at ultra effort')
+    expect(out.personaId).toBe('eng')
+    expect(out.model).toBe('gpt-6-astra')
+    expect(out.reasoning).toBe('ultra')
+    expect(out.cleanedText).toBe('use astra at ultra effort')
+  })
+
+  test('keeps the persona when the strategy request fails', async () => {
+    const strategy = createOpenAiMessageOverridesStrategy({
+      apiKey: 'test-key',
+      fetch: mock(async () => new Response('boom', { status: 500 })) as unknown as typeof fetch,
+      model: 'gpt-5.4-nano'
+    })
+    const out = await strategy('--persona eng hello')
+    expect(out.personaId).toBe('eng')
+    expect(out.cleanedText).toBe('hello')
+  })
+})
+
+
+test('ordinary messages skip the classifier and preserve persona flags', async () => {
+  const fetchFn = mock(() => { throw new Error('classifier must not run') })
+  const strategy = createOpenAiMessageOverridesStrategy({
+    apiKey: 'test-key', model: 'gpt-5.4-nano', fetch: fetchFn as unknown as typeof fetch
+  })
+  expect(await strategy('--persona eng deploy the thing')).toEqual({ cleanedText: 'deploy the thing', personaId: 'eng' })
+  expect(fetchFn).not.toHaveBeenCalled()
+})

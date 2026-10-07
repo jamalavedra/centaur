@@ -1,0 +1,327 @@
+---
+title: Google Chat
+description: Configure Centaur's signed Google Chat ingress, scoped agent permissions, delegated Workspace operations, durable delivery, and verification.
+---
+
+# Google Chat
+
+Centaur's Google Chat integration accepts signed Chat events, hands durable work
+to the shared session API, and delivers the final answer into the originating
+thread. Agent tools call the Rust API with a short-lived, principal-scoped JWT.
+They never receive the Google service-account key or the private credential
+between api-rs and googlechatbot.
+
+```text
+Google Chat -- signed HTTPS event --> googlechatbot
+                                       |
+                                       +--> api-rs session API --> sandbox
+
+sandbox -- Console JWT --> api-rs -- exact operation/space check --> googlechatbot
+                                                                  --> Google APIs
+```
+
+The chart's NetworkPolicy permits api-rs, but not sandbox or workflow pods, to
+reach googlechatbot's private `/api/chat/*` routes when `networkPolicy.enabled`
+is true and the cluster's CNI enforces these policies. Keep the public Ingress
+limited to `googlechatbot.eventsPath`.
+
+## Create the Google Chat app
+
+1. Create a Google Cloud project and service account, then enable the Google
+   Chat API.
+2. Configure a Chat app whose HTTP endpoint is
+   `https://<chat-host>/api/chat/events`.
+3. Install the app in a non-production Workspace first. History reads using
+   app auth require the app's Marketplace/admin installation and the
+   `chat.app.messages.readonly` scope.
+4. Store the service-account JSON as `GOOGLE_SERVICE_ACCOUNT_JSON` in the
+   Secret selected by `secretManager.existingSecretName`.
+5. Set a random `GOOGLECHATBOT_INTERNAL_API_KEY` in that Secret. The chart
+   injects it into api-rs and googlechatbot; never expose it to a sandbox.
+
+The normal app credential uses these scopes:
+
+| Scope | Use |
+| --- | --- |
+| `https://www.googleapis.com/auth/chat.bot` | App-authenticated Chat operations and bot identity. |
+| `https://www.googleapis.com/auth/chat.app.messages.readonly` | App-member space history for live context and ETL; requires Workspace administrator approval. |
+
+## Configure signed ingress
+
+Signed requests are required by default. Select exactly one ingress contract;
+issuers, audiences, signer identity, and key sets are never mixed across modes:
+
+| `ingressMode` | Google surface | Required values |
+| --- | --- | --- |
+| `chat_api_project` | Chat API, project-number audience | `projectNumber` |
+| `chat_api_url` | Chat API, exact endpoint-URL audience | `webhookAudience` |
+| `workspace_addon` | Workspace Add-on, exact endpoint-URL audience | `webhookAudience`, `addonServiceAccountEmail`; add `addonOauthClientId` to verify `userIdToken` identity |
+
+```yaml
+googlechatbot:
+  enabled: true
+  requireSignedRequests: true
+  ingressMode: chat_api_project
+  projectNumber: "123456789012"
+  signedRequestMaxAgeSeconds: 300
+  # Only workspace_addon + verified userIdToken can supply a user email.
+  allowedDomain: ""
+  ingress:
+    enabled: true
+    className: nginx
+    host: chat.example.com
+    tls:
+      - hosts: [chat.example.com]
+        secretName: chat-example-com-tls
+```
+
+The bot verifies the selected mode's issuer, signature, audience, key set,
+signer identity where applicable, numeric `iat` and `exp`, and token age before
+processing the body. `allowedDomain` is an additional human-identity filter,
+not request authentication. Google Chat `User` resources contain no email, so
+only a separately verified Workspace Add-on `userIdToken` can satisfy a
+non-empty domain allowlist. Configuring `allowedDomain` for either Chat API mode
+therefore rejects every event by design.
+
+Google's request token does not bind the JSON body. Centaur therefore labels a
+space principal with a requester email only when it came from a verified
+Add-on `userIdToken` or the directory lookup below, passed the allowlist,
+matched the event user ID, and the 1:1 DM was confirmed with `spaces.get`. Legacy Chat API events create
+sessions without human email identity. Shared spaces and group chats do not
+inherit a requester's personal credentials.
+
+Each turn also binds the sender's own `gchat-user-<email>-<sha256[:12]>` principal as
+the requester, in DMs and group spaces alike, from the same verified and
+allowlisted email but without the DM confirmation. Its direct grants apply to
+that turn only, so a person's desktop or credential follows them into a group
+without the space principal ever holding it. See
+[advanced permissioning](/secrets/advanced-permissioning).
+
+Google does not attach `userIdToken` to the events of a standalone HTTP Chat
+app, whatever the Marketplace scopes say, and answering with
+`requesting_google_scopes` only makes Chat re-send the same event. The sender's
+email therefore comes from the Workspace directory: for a MESSAGE whose bearer
+verified as the add-on's service account, the bot resolves the sender's
+`users/<id>` with the Admin SDK (`directory/v1/users/<id>`) as
+`GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` through domain-wide delegation with
+`https://www.googleapis.com/auth/admin.directory.user.readonly`. The id is
+Google's own claim inside a Google-signed request, which is why it is trusted;
+unsigned requests and other ingress modes never resolve. Answers are cached for
+a day. Unset the user and every event stays anonymous. Outcomes are counted in
+`googlechatbot_sender_lookup_total`.
+
+That subject must hold the admin privilege to read users, and the service
+account's DWD client must be authorized for that scope. If either is missing,
+every lookup answers `outcome="unknown"` and every turn goes out anonymous —
+which routes no desktop and surfaces as a 403 from `cua.fort.dev`, not as an
+auth error. This call previously used People API `people.get` with
+`sources=READ_SOURCE_TYPE_PROFILE`, which reads only the *impersonated user's
+own* profile: it answered 200 with no `emailAddresses` for everyone else, so
+`GOOGLECHATBOT_DIRECTORY_LOOKUP_USER` was the only person who could ever be
+identified.
+
+`requireSignedRequests: false` exists only for local fixture development. Do not
+use it as a production rollback switch.
+
+## Grant per-space permissions
+
+In the Console, open a principal or role and add an exact Google Chat space
+resource such as `spaces/AAAA`. Enable only the operations it needs:
+
+| Permission | Agent capability |
+| --- | --- |
+| Send | Create a message in the space. |
+| Update | Update a message owned by the app or configured delegated sender. |
+| Delete | Delete a message owned by the app or configured delegated sender. |
+| Upload | Upload a file and create the containing message. |
+| Download | Fetch message-qualified attachment metadata and raw bytes. |
+| History | List/search messages, read threads, list files, questions, dumps, and feedback scans. |
+| Members | List space members. |
+| Reactions | Read message reactions. |
+
+Direct and role grants are merged with OR semantics. A grant applies only to
+the exact normalized resource; knowing another `spaces/...` or
+`messages/...` name does not grant it. Update and delete also retain Google's
+ownership check for the selected app or delegated credential.
+
+DM creation has a separate grant. Add an exact email address under **Google
+Chat DM permissions**. Resource names such as `users/<id>` and the legacy
+`users/<email>` form are rejected before Google is called. The `google-chat dm`
+command asks api-rs to create or reuse that target's DM and send the first text
+in one operation. The caller cannot replace the returned space or reuse the DM
+as an ungranted send target.
+
+Permission changes invalidate the principal's cached sandbox configuration.
+New short-lived JWTs contain only the effective space-operation arrays and DM
+setup targets; the Console never places Google credentials in them.
+
+## Configure delegated operations
+
+Some Google APIs reject app auth. Grant domain-wide delegation (DWD) to the
+service account's OAuth client ID and use separate Workspace subjects so each
+capability can be revoked independently:
+
+| Helm value | Scope | Use and failure mode |
+| --- | --- | --- |
+| `googlechatbot.uploadUser` | `chat.messages.create` | Upload a file and post it. Empty means uploads return 503. The message is authored by this user. |
+| `googlechatbot.reactionReadUser` | `chat.messages.reactions.readonly` | Read reactions. Empty means reaction reads return 503. |
+| `googlechatbot.driveDownloadUser` | `drive.readonly` | Download Drive-backed Chat attachments. Empty or denied access degrades inbound content to metadata. |
+
+Live 1:1 DM turns use the bot's retained transcript and do not call Google's
+history API. Agent-facing DM history reads need `chat.messages.readonly` and
+use the exact reader subject selected by the Console for that space. The agent
+cannot choose the reader or fall back to a broader credential.
+
+DM setup has no fixed Helm subject. The validated target email is impersonated
+with `chat.spaces.create`, so the target must be an active, impersonable user in
+the service account's Workspace domain.
+
+Scheduled DM ETL uses the exact lowercase subjects in
+`apiRs.etl.googleChat.dmSync.subjects` and additionally needs
+`chat.spaces.readonly`, `chat.memberships.readonly`, and
+`chat.messages.reactions.readonly`. The workflow sandbox sends bounded read
+requests to api-rs; googlechatbot alone receives `GOOGLE_SERVICE_ACCOUNT_JSON`
+and mints the delegated token.
+
+Keep each subject dedicated to its documented role. Do not grant a superset of
+the scopes above to one convenience account.
+
+## Conversation and file behavior
+
+- Named spaces, group chats, and 1:1 DMs are supported. Named/group ingress
+  requires an exact bot mention; a single-user bot DM is inherently addressed.
+- Legacy Chat events and Workspace Add-ons button, app-command, and form
+  payloads normalize into typed workflow events. Durable dedupe keys include
+  the event time, space, message, user, function, and canonical parameters.
+- The bot includes at most `googlechatbot.threadHistoryLimit` prior messages
+  per turn, 50 by default, in a newest-biased 24,000-character context block.
+  Named spaces and group chats fetch history from Google. DMs replay retained
+  user turns and delivered assistant answers, with attachment metadata only.
+  The transcript does not backfill messages that the bot never retained.
+- The first 10 attachments on an accepted message are hydrated. A file may be
+  at most 100 MiB, and all decoded attachments in one turn share the
+  `googlechatbot.attachmentAggregateMaxBytes` ceiling (100 MiB by default).
+- Files up to 25 MiB are inlined. Larger accepted files use bounded,
+  SHA-256-checked `attachment.chunk` staging before execution.
+- Agent uploads and proxy downloads have a 100 MiB server ceiling. The CLI
+  download default is 10 MiB and refuses to overwrite an existing file.
+- A complete serialized Google `Message` is capped at 32,000 UTF-8 bytes.
+  Longer answers are split losslessly into ordered, retry-safe messages.
+- Ordinary answers use Chat text formatting. Standalone images use Cards v2
+  unless the requester asks for plain text; a Console link may add a small
+  card. Cards contain at most 100 widgets and no empty sections. The first
+  final part PATCHes `text` and `cardsV2` onto the thinking acknowledgement.
+  Replacement and overflow parts use stable client IDs. Card creates include
+  `fallbackText`; the in-place PATCH omits that create-only field.
+- Every write threads: `message.thread.name` plus
+  `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`. Google shipped
+  in-line threading to DMs and group DMs on 2025-11-05, and `spaces.get` on a
+  1:1 bot DM reports `spaceThreadingState: THREADED_MESSAGES`. Verified live on
+  2026-08-19: a threaded create in a real DM succeeded and returned
+  `threadReply: true`.
+- Drive downloads validate metadata, size, and downloadable capability. Missing
+  optional access produces a metadata-only part rather than leaking a signed
+  URL. Google-native Docs/Sheets/Slides/Drawings/Apps Script use documented
+  `files.export` MIME/extension pairs and its separate 10 MB ceiling. Vids stay
+  metadata-only until the long-running `files.download` flow is implemented.
+
+The agent CLI includes space discovery, metadata, members, paginated history,
+threads, bounded search, reactions, DM setup/send, questions, dump, feedback,
+message send/update/delete, upload, file list/search/info, and raw download.
+Every command routes through api-rs authorization.
+
+## Deliver scheduled tasks
+
+Console scheduled tasks deliver to Google Chat as well as Slack. The
+destination is one string and is dispatched by shape: a Slack ID, a
+`spaces/<id>` resource name, or an email address.
+
+- A space is available to a task only while the author's console principal
+  holds an effective **Send** grant for that exact space, directly or through a
+  role. The grant is checked when the task is saved and again when each run is
+  enqueued, so revoking it stops the next run before any Chat call.
+- An email destination must be the author's own console email. The workflow
+  resolves it to the bot's 1:1 DM space at run time (create-or-reuse), so no
+  space name is stored.
+
+Each run makes one agent turn, formats the answer as Google Chat text
+(`*bold*`, `_italics_`, `<url|label>`), splits it into 4,000-character chunks,
+posts the first chunk and threads the rest under it, and appends a plain-text
+`Sent by <email>'s scheduled task` footer. Delivery failures land in the task's
+last error in the Console.
+
+## Durable delivery and health
+
+Googlechatbot requires Postgres state in production. It does not bind the
+webhook port until the state adapter connects, and there is no in-memory
+production fallback.
+
+Accepted events, action dedupe, sticky harness/model/provider selection,
+forwarded/executed message IDs, DM transcripts, active execution state, and
+final-render obligations are durable. During a live turn, SSE reconnects from
+the last event ID. After restart, recovery replays the execution from its start
+to rebuild the answer, or reuses an already stored final answer, then updates
+the thinking message. Only a definitive missing acknowledgement creates a stable replacement;
+ambiguous PATCH failures remain durable retry obligations. Old obligations and
+repeated failures are bounded by the configured age and failure budget.
+
+| Endpoint | Meaning |
+| --- | --- |
+| `/health/live` | Process liveness only. |
+| `/health/ready` | 200 only after durable state connects; otherwise 503. |
+| `/health` | Compatibility alias for readiness. |
+| `/metrics` | Prometheus counters and gauges for events, runs, identity, session API calls, dedupe, recovery, timeouts, delivery, database state, open SSE connections, and pending obligations. |
+
+The Helm chart uses separate liveness/readiness probes and enables Prometheus
+scrape annotations by default when googlechatbot is enabled.
+
+## Verify before production
+
+Run the deterministic checks first:
+
+```bash
+pnpm --filter googlechatbot run check:types
+pnpm --filter googlechatbot test
+pnpm --filter googlechatbot run smoke
+./.github/scripts/run-tool-tests.sh
+helm lint contrib/chart
+```
+
+Then run the live matrix in a dedicated non-production Workspace and Kind
+cluster:
+
+1. Send real Google-signed events using both configured audience forms. Exercise
+   mention, DM, group space, stop, follow-up attachment, duplicate delivery,
+   button, app command, and form submission. Confirm unsigned, expired, wrong
+   audience, and wrong-domain events are rejected.
+2. From a real sandbox JWT, exercise each allowed operation and its denied
+   counterpart against a second ungranted space. Include DM target setup,
+   reactions, upload, Drive download, update/delete ownership, and exact
+   message-qualified attachment paths.
+3. Check file boundaries at 25 MiB, 25 MiB + 1, 100 MiB, and 100 MiB + 1;
+   reconstruct staged chunks and compare the SHA-256 digest.
+4. In Kind, use two bot replicas, enforce NetworkPolicy, kill the processing pod
+   during a turn, and verify exactly one final answer, no stranded thinking
+   message, a drained obligation gauge, and visible recovery/delivery metrics.
+5. In the Console, use keyboard-only navigation at narrow and wide viewports and
+   save screenshots for permission CRUD and malformed-input errors.
+
+Record redacted request IDs, resource names, screenshots, and metrics with the
+tested commit or image digest.
+
+## Roll back safely
+
+1. Disable the public Google Chat endpoint or set `googlechatbot.enabled=false`,
+   then deploy. Do not disable signature verification while leaving ingress
+   public.
+2. Set `apiRs.etl.googleChat.enabled=false` and
+   `apiRs.etl.googleChat.dmSync.enabled=false` to stop new ingestion.
+3. Revoke the service account's DWD scopes and remove the Chat app installation
+   if the integration is being retired.
+4. Remove Google Chat space and DM grants from affected principals and roles.
+5. Use `helm rollback` for the workloads. Leave additive database migrations in
+   place during application rollback; prune retained data separately after a
+   reviewed dry run.
+
+See [Google Chat ETL](/operate/google-chat-etl) for history ingestion, private
+DM isolation, retention, and ETL metrics.

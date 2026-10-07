@@ -15,8 +15,10 @@ use crate::IronControlClient;
 use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
-    PrincipalRef, derive_github_requester_principal, derive_principal_with_slack_team,
-    derive_slack_requester_principal, is_direct_message, slack_conversation_id,
+    GCHAT_DIRECT_MESSAGE_SPACE_TYPE, GCHAT_DM_KIND, GCHAT_SPACE_KIND, PrincipalRef,
+    derive_gchat_requester_principal, derive_github_requester_principal,
+    derive_principal_with_slack_team, derive_slack_requester_principal, is_direct_message,
+    parse_gchat_space, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -25,6 +27,14 @@ struct SessionPrincipalMetadata<'a> {
     slack_team_id: Option<&'a str>,
     slack_user_email: Option<&'a str>,
     conversation_name: Option<&'a str>,
+    /// Email verified by googlechatbot from an Add-on userIdToken and released
+    /// only after domain and DM checks. Separate from Slack's users.info email.
+    user_email: Option<&'a str>,
+    /// Google Chat ``SpaceType`` for the conversation this session runs in.
+    space_type: Option<&'a str>,
+    /// Whether the googlechatbot authenticated the inbound webhook against
+    /// Google's signed request JWT before handing us this event.
+    request_verified: bool,
 }
 
 impl<'a> SessionPrincipalMetadata<'a> {
@@ -43,9 +53,18 @@ impl<'a> SessionPrincipalMetadata<'a> {
             conversation_name: metadata
                 .get("slack_conversation_name")
                 .or_else(|| metadata.get("discord_conversation_name"))
+                .or_else(|| metadata.get("googlechat_conversation_name"))
                 .or_else(|| metadata.get("linear_conversation_name"))
                 .or_else(|| metadata.get("teams_conversation_name"))
                 .and_then(Value::as_str),
+            user_email: metadata.get("user_email").and_then(Value::as_str),
+            space_type: metadata
+                .get("googlechat_space_type")
+                .and_then(Value::as_str),
+            request_verified: metadata
+                .get("googlechat_request_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 }
@@ -99,6 +118,7 @@ impl SessionRegistrar {
         )?;
         let mut input = principal.to_principal_input();
         apply_slack_dm_email(thread_key, metadata.slack_user_email, &mut input);
+        apply_gchat_identity(thread_key, &metadata, &mut input);
         let existing = self.merge_existing_labels(&mut input).await?;
         let slack_permission = session_slack_permission(thread_key, &input, existing.is_some());
         let record = match principal_write(existing, create_if_missing) {
@@ -120,12 +140,14 @@ impl SessionRegistrar {
 
     /// Bind the principal of the human requesting this turn, resolved from the
     /// execute metadata (see [`requester_plan`]): fetched for authenticated
-    /// Console executions and upserted for Slack channel and GitHub turns.
-    /// Returns ``Ok(None)`` when the metadata carries no eligible requester.
-    /// For Slack that includes DM threads (the conversation principal already
-    /// is the user's) and requesters not proven to belong to the Slack app's
-    /// home team, which prevents Slack Connect users from supplying requester
-    /// credentials to a shared channel turn.
+    /// Console executions and upserted for Slack channel, GitHub and Google
+    /// Chat turns. Returns ``Ok(None)`` when the metadata carries no eligible
+    /// requester. For Slack that includes DM threads (the conversation
+    /// principal already is the user's) and requesters not proven to belong to
+    /// the Slack app's home team, which prevents Slack Connect users from
+    /// supplying requester credentials to a shared channel turn. Google Chat
+    /// DMs are not excluded: their conversation principal is the space, so
+    /// the per-user principal is the only one that names the person.
     ///
     /// Unlike [`Self::register_session`], this never writes Slack channel
     /// permissions: the requester principal only scopes proxy credentials, and
@@ -244,7 +266,8 @@ enum RequesterPlan {
     /// field also covers Console replies to non-Console threads.
     FetchExisting(String),
     /// Upsert the api-rs-owned per-user principal derived from the ingress's
-    /// verified actor identity (Slack channel turns, GitHub turns).
+    /// verified actor identity (Slack channel turns, GitHub turns, Google
+    /// Chat turns).
     UpsertDerived(PrincipalRef),
 }
 
@@ -273,6 +296,9 @@ fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
     {
         return Some(RequesterPlan::UpsertDerived(principal));
     }
+    if let Some(principal) = gchat_requester(thread_key, metadata) {
+        return Some(RequesterPlan::UpsertDerived(principal));
+    }
     let slack_team_id = eligible_slack_requester_team(metadata)?;
     let slack_user_id = metadata.get("slack_user_id").and_then(Value::as_str)?;
     derive_slack_requester_principal(
@@ -282,6 +308,30 @@ fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
         metadata.get("slack_display_name").and_then(Value::as_str),
     )
     .map(RequesterPlan::UpsertDerived)
+}
+
+/// The Google Chat requester, from the email googlechatbot verified on the
+/// Add-on `userIdToken` and released only after its domain allowlist. It
+/// travels under its own key so the display-only `user_email` on message
+/// metadata, which is not gated, can never be mistaken for it, and the bot's
+/// `googlechat_request_verified` flag is required as well so a turn that
+/// skipped signature verification names no requester.
+fn gchat_requester(thread_key: &str, metadata: &Value) -> Option<PrincipalRef> {
+    let verified = metadata
+        .get("googlechat_request_verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !verified {
+        return None;
+    }
+    let email = metadata
+        .get("googlechat_requester_email")
+        .and_then(Value::as_str)?;
+    derive_gchat_requester_principal(
+        thread_key,
+        email,
+        metadata.get("user_name").and_then(Value::as_str),
+    )
 }
 
 fn eligible_slack_requester_team(metadata: &Value) -> Option<&str> {
@@ -340,6 +390,52 @@ fn set_slack_email(input: &mut PrincipalInput, slack_user_email: Option<&str>) {
     if input.slack_user_id.is_some() {
         input.slack_email = Some(email.to_owned());
     }
+}
+
+/// Set the Google Chat principal kind and label a verified DM requester.
+///
+/// googlechatbot verifies the Add-on userIdToken, applies the domain allowlist,
+/// and confirms a one-human DM with Google before sending user_email. Its
+/// request JWT alone does not authenticate an email in the event body.
+/// This layer requires a Google Chat key, DIRECT_MESSAGE, request verification,
+/// and a non-empty email before assigning the credential-bearing google_email
+/// label. Shared spaces must never inherit one member's personal credentials.
+fn apply_gchat_identity(
+    thread_key: &str,
+    metadata: &SessionPrincipalMetadata<'_>,
+    input: &mut PrincipalInput,
+) {
+    if parse_gchat_space(thread_key).is_none() {
+        return;
+    }
+    let Some(space_type) = metadata
+        .space_type
+        .map(str::trim)
+        .filter(|space_type| !space_type.is_empty())
+    else {
+        return;
+    };
+    let is_dm = space_type.eq_ignore_ascii_case(GCHAT_DIRECT_MESSAGE_SPACE_TYPE);
+    let kind = if is_dm {
+        GCHAT_DM_KIND
+    } else {
+        GCHAT_SPACE_KIND
+    };
+    input.kind = Some(kind.to_owned());
+
+    if !is_dm || !metadata.request_verified {
+        return;
+    }
+    let Some(email) = metadata
+        .user_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        return;
+    };
+    input
+        .labels
+        .insert("google_email".to_owned(), email.to_owned());
 }
 
 fn slack_permission(channel_id: String) -> SlackChannelPermissionInput {
@@ -940,5 +1036,233 @@ mod tests {
             json!({"data": {"id": id, "foreign_id": foreign_id, "name": "stub", "labels": labels}})
                 .to_string(),
         )
+    }
+
+    const GCHAT_DM_THREAD: &str = "chat:spaces:AAAA:spaces:AAAA:threads:T1";
+
+    fn gchat_input(metadata: Value) -> PrincipalInput {
+        let mut input = derive_principal(GCHAT_DM_THREAD, None, None)
+            .expect("Google Chat principal should be derivable")
+            .to_principal_input();
+        apply_gchat_identity(
+            GCHAT_DM_THREAD,
+            &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
+            &mut input,
+        );
+        input
+    }
+
+    #[test]
+    fn session_principal_metadata_accepts_googlechat_name() {
+        assert_eq!(
+            SessionPrincipalMetadata::from_session_metadata(Some(&json!({
+                "googlechat_conversation_name": "Ada Lovelace"
+            })))
+            .conversation_name,
+            Some("Ada Lovelace")
+        );
+    }
+
+    #[test]
+    fn session_principal_metadata_carries_googlechat_space_fields() {
+        let raw = json!({
+            "user_email": "ada@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        let metadata = SessionPrincipalMetadata::from_session_metadata(Some(&raw));
+        assert_eq!(metadata.user_email, Some("ada@example.com"));
+        assert_eq!(metadata.space_type, Some("DIRECT_MESSAGE"));
+        assert!(metadata.request_verified);
+    }
+
+    #[test]
+    fn gchat_dm_labels_carry_the_verified_requester_email() {
+        let input = gchat_input(json!({
+            "user_email": " ada@example.com ",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        }));
+        assert_eq!(input.kind.as_deref(), Some("gchat_dm"));
+        assert_eq!(
+            input.labels.get("google_email").map(String::as_str),
+            Some("ada@example.com")
+        );
+    }
+
+    #[test]
+    fn gchat_group_spaces_never_carry_an_email() {
+        for space_type in ["GROUP_CHAT", "SPACE"] {
+            let input = gchat_input(json!({
+                "user_email": "ada@example.com",
+                "googlechat_space_type": space_type,
+                "googlechat_request_verified": true
+            }));
+            assert_eq!(
+                input.kind.as_deref(),
+                Some("gchat_space"),
+                "{space_type} must not be treated as a 1:1 conversation"
+            );
+            assert_eq!(
+                input.labels.get("google_email"),
+                None,
+                "{space_type} must not adopt one member's identity"
+            );
+        }
+    }
+
+    #[test]
+    fn gchat_dm_email_requires_a_verified_request() {
+        // An unverified event body is attacker-controllable, so its email must
+        // not become an identity reconciliation will grant credentials to.
+        let input = gchat_input(json!({
+            "user_email": "attacker@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE"
+        }));
+        assert_eq!(input.kind.as_deref(), Some("gchat_dm"));
+        assert_eq!(input.labels.get("google_email"), None);
+    }
+
+    #[test]
+    fn gchat_identity_is_skipped_without_a_space_type() {
+        // An ingress that predates the space-type contract leaves the principal
+        // exactly as it is today rather than being guessed into a kind.
+        let input = gchat_input(json!({
+            "user_email": "ada@example.com",
+            "googlechat_request_verified": true
+        }));
+        assert_eq!(input.kind, None);
+        assert_eq!(input.labels.get("google_email"), None);
+    }
+
+    #[test]
+    fn gchat_identity_ignores_non_gchat_threads() {
+        // The Slack-compatible `chat:C…` adapter key is not Google Chat.
+        let mut input = derive_principal("chat:C123:1780000000.000000", None, None)
+            .expect("Slack-compatible principal should be derivable")
+            .to_principal_input();
+        let before = input.clone();
+        let metadata = json!({
+            "user_email": "ada@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        for thread_key in ["chat:C123:1780000000.000000", "slack:T123:D123:1780.1"] {
+            apply_gchat_identity(
+                thread_key,
+                &SessionPrincipalMetadata::from_session_metadata(Some(&metadata)),
+                &mut input,
+            );
+        }
+        assert_eq!(input, before);
+    }
+
+    #[test]
+    fn slack_dm_labels_are_unchanged_by_googlechat_metadata() {
+        // Slack keeps sourcing its address from `slack_user_email`; a stray
+        // `user_email` must not leak into a Slack principal.
+        let mut input = derive_principal("slack:T123:D123:1780.1", Some("U123"), None)
+            .expect("Slack DM principal should be derivable")
+            .to_principal_input();
+        let metadata = json!({
+            "slack_user_id": "U123",
+            "slack_user_email": "ada@example.com",
+            "user_email": "someone-else@example.com",
+            "googlechat_space_type": "DIRECT_MESSAGE",
+            "googlechat_request_verified": true
+        });
+        let parsed = SessionPrincipalMetadata::from_session_metadata(Some(&metadata));
+        apply_slack_dm_email(
+            "slack:T123:D123:1780.1",
+            parsed.slack_user_email,
+            &mut input,
+        );
+        apply_gchat_identity("slack:T123:D123:1780.1", &parsed, &mut input);
+        assert_eq!(input.slack_email.as_deref(), Some("ada@example.com"));
+        assert_eq!(input.labels.get("google_email"), None);
+        assert_eq!(input.kind.as_deref(), Some("slack_dm"));
+    }
+
+    #[tokio::test]
+    async fn register_requester_upserts_gchat_user_principal_for_any_space() {
+        // A group thread and a DM both resolve the same person to the same
+        // per-user principal: Chat sessions key on the space, so this is the
+        // only principal a personal grant can live on.
+        for thread_key in [
+            "chat:spaces:GROUP:spaces:GROUP:threads:T1",
+            "chat:spaces:DM:spaces:DM:threads:T2",
+        ] {
+            let (base_url, requests, server) = spawn_iron_control_stub(|method, path| {
+                if method == "PUT" && path.ends_with("/gchat-user-ada-example-com-b5fc85e55755") {
+                    principal(
+                        "prn_user",
+                        "gchat-user-ada-example-com-b5fc85e55755",
+                        json!({}),
+                    )
+                } else {
+                    not_found()
+                }
+            })
+            .await;
+            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+            let metadata = json!({
+                "user_id": "users/123",
+                "user_name": "Ada Lovelace",
+                "user_email": "ada@example.com",
+                "googlechat_request_verified": true,
+                "googlechat_requester_email": "ada@example.com"
+            });
+
+            let principal = registrar
+                .register_requester(thread_key, Some(&metadata))
+                .await
+                .unwrap()
+                .expect("a verified Chat requester resolves to a principal");
+            assert_eq!(principal.id, "prn_user");
+
+            let requests = requests.lock().unwrap();
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request.path.ends_with("/roles"))
+            );
+            let upsert = requests
+                .iter()
+                .find(|request| request.method == "PUT")
+                .and_then(|request| request.body.as_ref())
+                .expect("gchat requester principal is upserted");
+            assert_eq!(upsert["data"]["kind"], "gchat_user");
+            assert_eq!(upsert["data"]["name"], "Google Chat User @Ada Lovelace");
+            assert_eq!(upsert["data"]["labels"]["google_email"], "ada@example.com");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn register_requester_ignores_unverified_or_display_only_gchat_emails() {
+        let thread_key = "chat:spaces:GROUP:spaces:GROUP:threads:T1";
+        for metadata in [
+            // Signature verification skipped: the email proves nothing.
+            json!({
+                "googlechat_request_verified": false,
+                "googlechat_requester_email": "ada@example.com"
+            }),
+            // Only the display-only message email, never gated by the bot.
+            json!({
+                "googlechat_request_verified": true,
+                "user_email": "ada@example.com"
+            }),
+            json!({ "googlechat_requester_email": "ada@example.com" }),
+        ] {
+            let (base_url, requests, server) = spawn_iron_control_stub(|_, _| not_found()).await;
+            let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+            let principal = registrar
+                .register_requester(thread_key, Some(&metadata))
+                .await
+                .unwrap();
+            assert_eq!(principal, None, "{metadata}");
+            assert!(requests.lock().unwrap().is_empty());
+            server.abort();
+        }
     }
 }
